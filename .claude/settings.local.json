@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(~/.platformio/penv/bin/pio run *)",
+      "Bash(system_profiler SPUSBDataType)",
+      "Bash(ioreg -p IOUSB -l -w 0)"
+    ]
+  }
+}
