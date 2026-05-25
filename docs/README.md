@@ -8,5 +8,6 @@ Diese Dokumentation beschreibt Aufbau, Installation, Konfiguration und Nutzung d
 - `hardware.md` – Benötigte Hardware und Pinbelegung
 - `configuration.md` – Einstellungen und Parameter
 - `usage.md` – Bedienung und Webinterface
+- `architektur.md` – Systemarchitektur und Softwareaufbau
 
 > Nutze die deutschsprachigen Seiten für eine strukturierte Projektübersicht.
