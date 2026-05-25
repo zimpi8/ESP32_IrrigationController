@@ -4,6 +4,16 @@
 
 Dieses Projekt ist ein vollständiger `ESP32`-basierter Bewässerungscontroller für bis zu 8 Kanäle. Es enthält Funktionen für manuelle Steuerung, Gruppenpläne, Warteschlangensteuerung, Winterentwässerung, WLAN-Konfiguration, Web-Oberfläche, lokale Protokollierung und optionales MQTT.
 
+## Dokumentation
+
+Zusätzliche Projektinformationen und ausführliche Anleitungen findest du im Ordner `docs/`:
+
+- `docs/README.md`
+- `docs/installation.md`
+- `docs/hardware.md`
+- `docs/configuration.md`
+- `docs/usage.md`
+
 ## Hauptfunktionen
 
 - Steuerung von bis zu 8 Relais-Kanälen
