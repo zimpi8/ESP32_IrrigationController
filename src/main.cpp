@@ -12,7 +12,7 @@
  * - Queue: Manuelle Starts werden gequeued wenn Kanal aktiv (SINGLE_CHANNEL_MODE)
  * 
  * Frameworks: Arduino-ESP32
- * Libraries:  Adafruit_GFX, Adafruit_SSD1306, QRCode (ricmoo), PubSubClient,
+ * Libraries:  U8g2, QRCode (ricmoo), PubSubClient,
  *             RTClib (optional DS3231), LittleFS
  */
 
@@ -24,8 +24,7 @@
 #include <Preferences.h>
 #include <time.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8g2lib.h>
 #include <qrcode.h>
 #include <deque>
 #include <LittleFS.h>
@@ -41,8 +40,12 @@ static const bool     RELAY_ACTIVE_LOW_DEFAULT = true;
 
 #define OLED_WIDTH    128
 #define OLED_HEIGHT   64
-#define OLED_RESET    -1
 #define OLED_ADDR     0x3C
+#define OLED_FONT     u8g2_font_6x10_tf
+// Display type selector:
+// 1 = SH1106 128x64
+// 0 = SSD1306 128x64
+#define USE_SH1106    1
 static const uint8_t  PIN_SDA = 5;
 static const uint8_t  PIN_SCL = 4;
 
@@ -139,7 +142,15 @@ static const char* TH_BORDER = "#30363d";
 // ==================== GLOBALS ===============================
 // ============================================================
 
-Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
+#if USE_SH1106
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+#else
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+#endif
+
+static const int8_t FONT_ASCENT = 8;
+static const int8_t FONT_LINE_H = 10;
+
 WebServer        server(80);
 DNSServer        dnsServer;
 Preferences      prefs;
@@ -381,19 +392,17 @@ String buildWifiStatusWithQuality() {
 
 void manageBrightness() {
   uint32_t inactiveSince = millis() - lastButtonPress;
-  
+
   if (inactiveSince > BRIGHTNESS_TIMEOUT_MS) {
     if (currentBrightness != BRIGHTNESS_LOW) {
       currentBrightness = BRIGHTNESS_LOW;
-      display.ssd1306_command(0x81);
-      display.ssd1306_command(BRIGHTNESS_LOW);
+      u8g2.setContrast(BRIGHTNESS_LOW);
       Serial.println("[OLED] Helligkeit: 30% (Inaktivität)");
     }
   } else {
     if (currentBrightness != BRIGHTNESS_NORMAL) {
       currentBrightness = BRIGHTNESS_NORMAL;
-      display.ssd1306_command(0x81);
-      display.ssd1306_command(BRIGHTNESS_NORMAL);
+      u8g2.setContrast(BRIGHTNESS_NORMAL);
       Serial.println("[OLED] Helligkeit: 100% (aktiv)");
     }
   }
@@ -997,93 +1006,98 @@ void initTime() {
 // ============================================================
 
 int drawWrapped(int x, int y, int wpx, const String& s) {
-  const int charW = 6, lineH = 8;
-  int maxChars = wpx / charW; 
+  const int charW = 6;
+  int maxChars = wpx / charW;
   if (maxChars < 1) maxChars = 1;
   for (int i = 0; i < (int)s.length(); i += maxChars) {
-    display.setCursor(x, y); 
-    display.print(s.substring(i, i+maxChars)); 
-    y += lineH;
+    u8g2.setCursor(x, y + FONT_ASCENT);
+    u8g2.print(s.substring(i, i + maxChars));
+    y += FONT_LINE_H;
   }
   return y;
 }
 
 void showQRCodeForAP() {
   String s = String("WIFI:T:WPA;S:") + AP_SSID + ";P:" + AP_PASS + ";;";
-  QRCode qr; 
+  QRCode qr;
   uint8_t buffer[qrcode_getBufferSize(3)];
   qrcode_initText(&qr, buffer, 3, ECC_LOW, s.c_str());
-  display.clearDisplay();
-  const int scale = 2, qrPx = qr.size*scale, offX = 0;
-  int offY = (OLED_HEIGHT - qrPx)/2; 
+  u8g2.clearBuffer();
+  u8g2.setFont(OLED_FONT);
+  const int scale = 2, qrPx = qr.size * scale, offX = 0;
+  int offY = (OLED_HEIGHT - qrPx) / 2;
   if (offY < 0) offY = 0;
   for (uint8_t y = 0; y < qr.size; y++)
     for (uint8_t x = 0; x < qr.size; x++)
       if (qrcode_getModule(&qr, x, y))
-        display.fillRect(offX+x*scale, offY+y*scale, scale, scale, SSD1306_WHITE);
-  const int tx = offX+qrPx+4, tw = OLED_WIDTH-tx; 
+        u8g2.drawBox(offX + x * scale, offY + y * scale, scale, scale);
+  const int tx = offX + qrPx + 4, tw = OLED_WIDTH - tx;
   int ty = 0;
-  display.setTextSize(1); 
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(tx, ty); 
-  display.print("AP-Login"); 
+  u8g2.setCursor(tx, ty + FONT_ASCENT);
+  u8g2.print("AP-Login");
   ty += 10;
-  display.setCursor(tx, ty); 
-  display.print("Netz:");    
-  ty += 8;
+  u8g2.setCursor(tx, ty + FONT_ASCENT);
+  u8g2.print("Netz:");
+  ty += FONT_LINE_H;
   ty = drawWrapped(tx, ty, tw, String(AP_SSID));
-  display.setCursor(tx, ty); 
-  display.print("Pass:");    
-  ty += 8;
+  u8g2.setCursor(tx, ty + FONT_ASCENT);
+  u8g2.print("Pass:");
+  ty += FONT_LINE_H;
   ty = drawWrapped(tx, ty, tw, String(AP_PASS));
-  display.display();
+  u8g2.sendBuffer();
 }
 
 void updateStatusDisplay() {
   if (currentMode == OP_AP) return;
-  display.clearDisplay();
-  display.setTextSize(1); 
-  display.setTextColor(SSD1306_WHITE); 
-  display.setCursor(0,0);
-  
+  u8g2.clearBuffer();
+  u8g2.setFont(OLED_FONT);
+  char buf[32];
+  int y = 0;
+
   if (winterActive) {
-    display.println("WINTER-ENTWAESSERUNG");
-    display.printf("Durchgang %u/%u\n", winterPass, WINTER_PASSES);
+    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print("WINTER-ENTW."); y += FONT_LINE_H;
+    snprintf(buf, sizeof(buf), "Durchgang %u/%u", winterPass, WINTER_PASSES);
+    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
     const char* ph = (winterPhase==WP_BLOW)?"BLASEN":(winterPhase==WP_PAUSE)?"PAUSE":"COOLDOWN";
-    if (winterPhase==WP_BLOW){ 
-      display.print(channelShort(winterChannel)); 
-      display.printf(" %s\n",ph); 
+    if (winterPhase == WP_BLOW) {
+      snprintf(buf, sizeof(buf), "%.8s %s", channelShort(winterChannel).c_str(), ph);
+    } else {
+      strncpy(buf, ph, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
     }
-    else display.printf("%s\n", ph);
-    display.printf("Rest: %lus\n",(unsigned long)winterPhaseRemainingSec());
-    display.printf("kumRun: %us\n", winterCumRunSec);
-    display.display(); 
+    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
+    snprintf(buf, sizeof(buf), "Rest: %lus", (unsigned long)winterPhaseRemainingSec());
+    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
+    snprintf(buf, sizeof(buf), "kumRun: %us", winterCumRunSec);
+    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf);
+    u8g2.sendBuffer();
     return;
   }
-  
-  display.println("Bewaesserung ESP32");
-  
-  if (WiFi.status()==WL_CONNECTED) {
-    display.print(WiFi.localIP().toString());
-    display.printf(" [%d%%]\n", getWifiSignalQuality());
+
+  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print("Bewaesserung ESP32"); y += FONT_LINE_H;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(buf, sizeof(buf), "%s [%d%%]", WiFi.localIP().toString().c_str(), getWifiSignalQuality());
   } else {
-    display.println("WiFi: offline");
+    strncpy(buf, "WiFi: offline", sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
   }
-  
-  display.println(nowTimeStr());
-  
+  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
+
+  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(nowTimeStr()); y += FONT_LINE_H;
+
   bool any = false;
-  for (uint8_t i = 0; i < 8; i++)
+  for (uint8_t i = 0; i < 8; i++) {
     if (channels[i].active) {
-      uint32_t rem = (channels[i].durationMs-(millis()-channels[i].startMs))/1000;
-      display.print(channelShort(i)); 
-      display.printf(" %lus\n",(unsigned long)rem); 
+      uint32_t rem = (channels[i].durationMs - (millis() - channels[i].startMs)) / 1000;
+      snprintf(buf, sizeof(buf), "%.8s %lus", channelShort(i).c_str(), (unsigned long)rem);
+      u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
       any = true;
     }
-  if (!any) display.println("Alle Kanaele aus");
-  
-  display.printf("Queue: %u\n",(unsigned)taskQueue.size());
-  display.display();
+  }
+  if (!any) { u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print("Alle Kanaele aus"); y += FONT_LINE_H; }
+
+  snprintf(buf, sizeof(buf), "Queue: %u", (unsigned)taskQueue.size());
+  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf);
+  u8g2.sendBuffer();
 }
 
 // ============================================================
@@ -1971,19 +1985,20 @@ void setup() {
   #endif
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+  u8g2.setI2CAddress(OLED_ADDR << 1);
+  if (!u8g2.begin()) {
     Serial.println("[OLED] Init fehlgeschlagen");
   } else {
-    display.ssd1306_command(0x81);
-    display.ssd1306_command(BRIGHTNESS_NORMAL);
+    u8g2.enableUTF8Print();
+    u8g2.setContrast(BRIGHTNESS_NORMAL);
     lastButtonPress = millis();
-    display.clearDisplay(); 
-    display.setTextSize(1); 
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0); 
-    display.println("Bewaesserung"); 
-    display.println("startet..."); 
-    display.display();
+    u8g2.clearBuffer();
+    u8g2.setFont(OLED_FONT);
+    u8g2.setCursor(0, FONT_ASCENT);
+    u8g2.print("Bewaesserung");
+    u8g2.setCursor(0, FONT_ASCENT + FONT_LINE_H);
+    u8g2.print("startet...");
+    u8g2.sendBuffer();
     Serial.println("[OLED] OK, Helligkeit: 100%");
   }
 
