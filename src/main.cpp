@@ -434,7 +434,7 @@ void handleExternalBrightnessButton() {
 // ============================================================
 
 void initLogging() {
-  if (!LittleFS.begin()) {
+  if (!LittleFS.begin(true)) {
     Serial.println("[LOG] LittleFS mount failed");
     return;
   }
@@ -1995,7 +1995,7 @@ void setup() {
     u8g2.clearBuffer();
     u8g2.setFont(OLED_FONT);
     u8g2.setCursor(0, FONT_ASCENT);
-    u8g2.print("Bewaesserung");
+    u8g2.print("Bewässerung");
     u8g2.setCursor(0, FONT_ASCENT + FONT_LINE_H);
     u8g2.print("startet...");
     u8g2.sendBuffer();
