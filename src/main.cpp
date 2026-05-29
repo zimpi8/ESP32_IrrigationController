@@ -23,6 +23,8 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <time.h>
+#include <stdarg.h>
+#include <sys/time.h>
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <qrcode.h>
@@ -43,10 +45,10 @@ static const bool     RELAY_ACTIVE_LOW_DEFAULT = true;
 #define OLED_ADDR     0x3C
 #define OLED_FONT     u8g2_font_6x10_tf
 // Display type selector:
-// 1 = SH1106 128x64
-// 0 = SSD1306 128x64
+// 1 = SH1106  128x64  1,3"
+// 0 = SSD1306 128x64  0.95"
 #define USE_SH1106    1
-static const uint8_t  PIN_SDA = 5;
+static const uint8_t  PIN_SDA = 5;  
 static const uint8_t  PIN_SCL = 4;
 
 static const uint8_t  PIN_AP_BUTTON     = 0;
@@ -56,12 +58,30 @@ static const uint32_t AP_BUTTON_HOLD_MS = 3000;
 // ================== EXTERNE TASTENKONFIGURATION ============
 // ============================================================
 
-// EXTERN_BRIGHTNESS_BUTTON aktivieren: 1 = ja, 0 = nein
+// Externer Helligkeits-/AP-Taster (GPIO 34, Input-only, BENÖTIGT ext. Pull-Up 10kΩ nach 3V3)
+// Kurz drücken (< 3 s) : Display aufhellen
+// Lang drücken (>= 3 s): AP-Konfig-Modus
+// Auf 0 lassen solange kein Taster angeschlossen ist – floatender Pin löst AP-Modus aus!
 #define EXTERN_BRIGHTNESS_BUTTON 0
-
 #if EXTERN_BRIGHTNESS_BUTTON
-  static const uint8_t PIN_BRIGHTNESS_BUTTON = 34;
+  static const uint8_t  PIN_BRIGHTNESS_BUTTON = 34;
+  static const uint32_t EXT_AP_HOLD_MS        = 3000;
 #endif
+
+// Externer NOT-AUS-Taster (GPIO 32, interner Pull-Up verfügbar)
+// Halten >= 5 s: stoppt alle Kanäle + Neustart ESP32
+#define EXTERN_ESTP_BUTTON 0
+#if EXTERN_ESTP_BUTTON
+  static const uint8_t  PIN_ESTP_BUTTON = 32;
+  static const uint32_t ESTP_HOLD_MS    = 5000;
+#endif
+
+// Impulseingang Wasserzähler (GPIO 33, interner Pull-Up verfügbar)
+#define WATER_METER_ENABLED 0
+#if WATER_METER_ENABLED
+  static const uint8_t PIN_WATER_METER = 33;
+#endif
+static const uint32_t WATER_IPL_DEFAULT = 100;  // Impulse pro Liter (Standard)
 
 static const char* WIFI_SSID = "YourSSID";
 static const char* WIFI_PASS = "YourPassword";
@@ -75,9 +95,11 @@ static const char* WEB_PASS  = "irrigation";
 
 static const char* DEVICE_HOSTNAME = "IrrigationController";
 
-static const char* NTP_SERVER          = "pool.ntp.org";
-static const long  GMT_OFFSET_SEC      = 3600;
-static const int   DAYLIGHT_OFFSET_SEC = 3600;
+static const char* NTP_SERVER    = "pool.ntp.org";
+// POSIX-TZ-String für korrekte Sommer-/Winterzeit (z. B. CET/CEST)
+// Änderbar über Web-Konfig → wird in NVS gespeichert
+static const char* TZ_DEFAULT   = "CET-1CEST,M3.5.0,M10.5.0/3";
+static const uint8_t TZ_STRING_MAX = 48;
 
 static const uint16_t DEFAULT_RUNTIME_SEC = 1800;
 static const uint16_t MAX_RUNTIME_SEC     = 7200;
@@ -87,6 +109,7 @@ static const bool     SINGLE_CHANNEL_MODE = true;
 static const uint8_t  MAX_GROUPS     = 8;
 static const uint8_t  MAX_STEPS      = 8;
 static const uint8_t  CH_NAME_MAX    = 20;
+static const uint8_t  CH_DISP_MAX   = 12;  // max. Zeichen Kanalname im OLED
 static const uint8_t  GROUP_NAME_MAX = 16;
 
 static const uint8_t  MAX_API_TOKENS = 5;
@@ -201,6 +224,7 @@ struct Group {
   uint8_t   hour;
   uint8_t   minute;
   uint8_t   daysMask;
+  uint16_t  monthsMask;   // Bits 0-11 = Jan–Dez; 0 = alle Monate aktiv
   uint8_t   stepCount;
   GroupStep steps[MAX_STEPS];
   uint32_t  lastRunDay;
@@ -223,10 +247,37 @@ uint32_t lastMqttRetry      = 0;
 bool     ntpSynced          = false;
 bool     rtcSynced          = false;
 
+char     tzString[TZ_STRING_MAX + 1] = {0};
+
+// Queue-Persistenz
+static bool queuePaused          = false;
+static bool queueRestoredFromNVS = false;
+
+// Wasserzähler
+#if WATER_METER_ENABLED
+static volatile uint32_t waterPulseCount = 0;
+#endif
+static uint32_t waterImpulsesPerLiter = WATER_IPL_DEFAULT;
+
+// Externe Taster – Zustandsvariablen
+#if EXTERN_BRIGHTNESS_BUTTON
+static uint32_t extBtnPressedSince = 0;
+static bool     extBtnApTriggered  = false;
+#endif
+#if EXTERN_ESTP_BUTTON
+static uint32_t estpPressedSince   = 0;
+#endif
+
 void stopAllChannels();
-void clearQueue();
+void clearQueue(const char* source = "system");
+void saveQueueToNVS();
+void saveActiveChannelToNVS();
+void clearActiveChannelNVS();
+void serialLog(const String& msg);
+void serialLog(const char* msg);
+void serialLogf(const char* fmt, ...);
 bool checkWebAuthOnly();
-String buildApConfigHtml(const String& msg);
+String buildApConfigHtml(const String&msg);
 void loadWifiCreds();
 void saveChannelName(uint8_t i, const String& name);
 void logEvent(uint8_t channel, const char* action, uint16_t durationSec, const char* source);
@@ -242,7 +293,7 @@ String channelName(uint8_t ch) {
 
 String channelShort(uint8_t ch) {
   String n = channelName(ch);
-  if (n.length() > 8) n = n.substring(0, 8);
+  if (n.length() > CH_DISP_MAX) n = n.substring(0, CH_DISP_MAX);
   return n;
 }
 
@@ -293,15 +344,33 @@ String groupLabel(uint8_t i) {
 
 void initRTC() {
   if (!rtc.begin()) {
-    Serial.println("[RTC] DS3231 nicht gefunden");
+    serialLog("[RTC] DS3231 nicht gefunden");
     rtcPresent = false;
     return;
   }
   if (rtc.lostPower()) {
-    Serial.println("[RTC] Batterieverlust erkannt, Zeit ungültig");
+    serialLog("[RTC] Batterieverlust erkannt, Zeit ungültig");
   }
   rtcPresent = true;
-  Serial.println("[RTC] DS3231 OK");
+  serialLog("[RTC] DS3231 OK");
+}
+
+bool setSystemTimeFromRtc() {
+  if (!rtcPresent || rtc.lostPower()) return false;
+  DateTime now = rtc.now();
+  struct tm ti;
+  memset(&ti, 0, sizeof(ti));
+  ti.tm_year = now.year() - 1900;
+  ti.tm_mon  = now.month() - 1;
+  ti.tm_mday = now.day();
+  ti.tm_hour = now.hour();
+  ti.tm_min  = now.minute();
+  ti.tm_sec  = now.second();
+  time_t epoch = mktime(&ti);
+  if (epoch == (time_t)-1) return false;
+  struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+  settimeofday(&tv, NULL);
+  return true;
 }
 
 void syncRtcFromNtp() {
@@ -312,16 +381,16 @@ void syncRtcFromNtp() {
   if (!getLocalTime(&ti, 50)) return;
   rtc.adjust(DateTime(ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
                       ti.tm_hour, ti.tm_min, ti.tm_sec));
-  Serial.println("[RTC] synchronisiert mit NTP");
+  serialLog("[RTC] synchronisiert mit NTP");
   rtcSynced = true;
 }
 
 String getRtcTimeStr() {
   if (!rtcPresent) return "--";
   DateTime now = rtc.now();
-  char buf[20];
-  snprintf(buf, sizeof(buf), "%02d.%02d. %02d:%02d:%02d",
-           now.day(), now.month(), now.hour(), now.minute(), now.second());
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%02d.%02d.%04d - %02d:%02d:%02d",
+           now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second());
   return String(buf);
 }
 
@@ -348,8 +417,8 @@ String nowTimeStr() {
   if (ntpSynced) {
     struct tm ti;
     if (getLocalTime(&ti, 50)) {
-      char buf[20];
-      strftime(buf, sizeof(buf), "%d.%m. %H:%M:%S", &ti);
+      char buf[24];
+      strftime(buf, sizeof(buf), "%d.%m.%Y - %H:%M:%S", &ti);
       return String(buf);
     }
   }
@@ -363,6 +432,56 @@ struct tm getLocalTimeWithFallback() {
   if (rtcPresent) return getRtcLocalTime();
   memset(&ti, 0, sizeof(ti));
   return ti;
+}
+
+
+String getSerialTimestamp() {
+  struct tm ti = getLocalTimeWithFallback();
+  char buf[32];
+  if (ti.tm_year > 0) {
+    snprintf(buf, sizeof(buf), "[%04d-%02d-%02d %02d:%02d:%02d] ",
+             ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+             ti.tm_hour, ti.tm_min, ti.tm_sec);
+  } else {
+    strcpy(buf, "[----] " );
+  }
+  return String(buf);
+}
+
+void serialLog(const String& msg) {
+  String s = msg;
+  if (s.length() && s.charAt(0) == '\n') {
+    Serial.println();
+    s = s.substring(1);
+  }
+  Serial.print(getSerialTimestamp());
+  Serial.println(s);
+}
+
+void serialLog(const char* msg) {
+  String s = String(msg);
+  if (s.length() && s.charAt(0) == '\n') {
+    Serial.println();
+    s = s.substring(1);
+  }
+  Serial.print(getSerialTimestamp());
+  Serial.println(s);
+}
+
+void serialLogf(const char* fmt, ...) {
+  char tmp[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(tmp, sizeof(tmp), fmt, ap);
+  va_end(ap);
+  if (tmp[0] == '\n') {
+    Serial.println();
+    Serial.print(getSerialTimestamp());
+    Serial.print(tmp + 1);
+  } else {
+    Serial.print(getSerialTimestamp());
+    Serial.print(tmp);
+  }
 }
 
 // ============================================================
@@ -397,37 +516,19 @@ void manageBrightness() {
     if (currentBrightness != BRIGHTNESS_LOW) {
       currentBrightness = BRIGHTNESS_LOW;
       u8g2.setContrast(BRIGHTNESS_LOW);
-      Serial.println("[OLED] Helligkeit: 30% (Inaktivität)");
+      serialLog("[OLED] Helligkeit: 30% (Inaktivität)");
     }
   } else {
     if (currentBrightness != BRIGHTNESS_NORMAL) {
       currentBrightness = BRIGHTNESS_NORMAL;
       u8g2.setContrast(BRIGHTNESS_NORMAL);
-      Serial.println("[OLED] Helligkeit: 100% (aktiv)");
+      serialLog("[OLED] Helligkeit: 100% (aktiv)");
     }
   }
 }
 
-// ============================================================
-// ================ EXTERNER HELLIGKEIT-TASTER ===============
-// ============================================================
-
-#if EXTERN_BRIGHTNESS_BUTTON
-static uint32_t lastExternalButtonPress = 0;
-static const uint32_t EXTERNAL_BUTTON_DEBOUNCE_MS = 50;
-
-void handleExternalBrightnessButton() {
-  bool pressed = (digitalRead(PIN_BRIGHTNESS_BUTTON) == LOW);
-  
-  if (pressed) {
-    if (millis() - lastExternalButtonPress > EXTERNAL_BUTTON_DEBOUNCE_MS) {
-      lastExternalButtonPress = millis();
-      lastButtonPress = millis();
-      Serial.println("[BTN] Externer Helligkeit-Taster");
-    }
-  }
-}
-#endif
+// Externe Taster-Handler: handleExternalBrightnessButton / handleEmergencyButton
+// → definiert weiter unten im Button-Abschnitt
 
 // ============================================================
 // ================= LOGGING (LittleFS + MQTT) ===============
@@ -435,10 +536,10 @@ void handleExternalBrightnessButton() {
 
 void initLogging() {
   if (!LittleFS.begin(true)) {
-    Serial.println("[LOG] LittleFS mount failed");
+    serialLog("[LOG] LittleFS mount failed");
     return;
   }
-  Serial.println("[LOG] LittleFS OK");
+  serialLog("[LOG] LittleFS OK");
   
   File f = LittleFS.open(LOG_FILE, "r");
   if (!f) {
@@ -446,7 +547,7 @@ void initLogging() {
     if (f) {
       f.println("timestamp,channel,name,action,durationSec,source");
       f.close();
-      Serial.println("[LOG] Neue Log-Datei erstellt");
+      serialLog("[LOG] Neue Log-Datei erstellt");
     }
   } else {
     f.close();
@@ -471,14 +572,14 @@ void logEvent(uint8_t channel, const char* action, uint16_t durationSec, const c
   if (f) {
     size_t written = f.print(line);
     f.close();
-    Serial.printf("[LOG] Event geschrieben (%u Bytes): %s\n", written, action);
+    serialLogf("[LOG] Event geschrieben (%u Bytes): %s\n", written, action);
   } else {
-    Serial.printf("[LOG] FEHLER: Datei konnte nicht geöffnet werden\n");
+    serialLogf("[LOG] FEHLER: Datei konnte nicht geöffnet werden\n");
   }
   f = LittleFS.open(LOG_FILE, "r");
   if (f && f.size() > LOG_MAX_SIZE_BYTES) {
     f.close();
-    Serial.printf("[LOG] Datei > %lu Bytes, könnte gekürzt werden\n", LOG_MAX_SIZE_BYTES);
+    serialLogf("[LOG] Datei > %lu Bytes, könnte gekürzt werden\n", LOG_MAX_SIZE_BYTES);
   } else if (f) f.close();
 
   if (mqttEnabled && mqttClient.connected()) {
@@ -489,10 +590,10 @@ void logEvent(uint8_t channel, const char* action, uint16_t durationSec, const c
       if (mqttRetryQueue.size() < MAX_MQTT_RETRY_QUEUE) {
         mqttRetryQueue.push_back({(uint32_t)millis(), {}});
         strncpy(mqttRetryQueue.back().event, payload.c_str(), sizeof(mqttRetryQueue.back().event) - 1);
-        Serial.printf("[MQTT] Event in Retry-Queue (%u)\n", (unsigned)mqttRetryQueue.size());
+        serialLogf("[MQTT] Event in Retry-Queue (%u)\n", (unsigned)mqttRetryQueue.size());
       }
     } else {
-      Serial.printf("[MQTT] Event gesendet: %s\n", action);
+      serialLogf("[MQTT] Event gesendet: %s\n", action);
     }
   } else if (mqttEnabled && !mqttClient.connected()) {
     if (mqttRetryQueue.size() < MAX_MQTT_RETRY_QUEUE) {
@@ -510,7 +611,7 @@ void logEvent(uint8_t channel, const char* action, uint16_t durationSec, const c
 // ============================================================
 
 void loadMqttConfig() {
-  prefs.begin("mqtt", true);
+  prefs.begin("mqtt", false);
   mqttEnabled = prefs.getBool("en", false);
   String h = prefs.getString("host", "");
   mqttPort = prefs.getUShort("port", MQTT_PORT_DEFAULT);
@@ -520,7 +621,7 @@ void loadMqttConfig() {
   strncpy(mqttHost, h.c_str(), MQTT_HOST_MAX);
   strncpy(mqttUser, u.c_str(), MQTT_USER_MAX);
   strncpy(mqttPass, p.c_str(), MQTT_PASS_MAX);
-  Serial.printf("[MQTT] enabled=%d host=%s port=%u\n", mqttEnabled, mqttHost, mqttPort);
+  serialLogf("[MQTT] enabled=%d host=%s port=%u\n", mqttEnabled, mqttHost, mqttPort);
 }
 
 void saveMqttConfig(bool en, const String& host, uint16_t port, const String& user, const String& pass) {
@@ -536,27 +637,27 @@ void saveMqttConfig(bool en, const String& host, uint16_t port, const String& us
 
 void mqttConnect() {
   if (!mqttEnabled || !WiFi.isConnected() || mqttClient.connected()) return;
-  if (!mqttHost[0]) { Serial.println("[MQTT] kein Host konfiguriert"); return; }
+  if (!mqttHost[0]) { serialLog("[MQTT] kein Host konfiguriert"); return; }
   mqttClient.setServer(mqttHost, mqttPort);
-  Serial.printf("[MQTT] Verbinde zu %s:%u...\n", mqttHost, mqttPort);
+  serialLogf("[MQTT] Verbinde zu %s:%u...\n", mqttHost, mqttPort);
   if (mqttUser[0] && mqttPass[0]) {
     if (mqttClient.connect(DEVICE_HOSTNAME, mqttUser, mqttPass)) {
-      Serial.println("[MQTT] verbunden (mit Auth)");
+      serialLog("[MQTT] verbunden (mit Auth)");
       while (!mqttRetryQueue.empty()) {
         if (mqttClient.publish(mqttTopic, mqttRetryQueue.front().event))
-          Serial.println("[MQTT] Retry-Event gesendet");
+          serialLog("[MQTT] Retry-Event gesendet");
         else break;
         mqttRetryQueue.pop_front();
       }
     } else {
-      Serial.printf("[MQTT] Connect fehlgeschlagen (rc=%d)\n", mqttClient.state());
+      serialLogf("[MQTT] Connect fehlgeschlagen (rc=%d)\n", mqttClient.state());
     }
   } else {
     if (mqttClient.connect(DEVICE_HOSTNAME)) {
-      Serial.println("[MQTT] verbunden (ohne Auth)");
+      serialLog("[MQTT] verbunden (ohne Auth)");
       while (!mqttRetryQueue.empty()) {
         if (mqttClient.publish(mqttTopic, mqttRetryQueue.front().event))
-          Serial.println("[MQTT] Retry-Event gesendet");
+          serialLog("[MQTT] Retry-Event gesendet");
         else break;
         mqttRetryQueue.pop_front();
       }
@@ -577,7 +678,7 @@ void maintainMqtt() {
 // ============================================================
 
 void loadApiTokens() {
-  prefs.begin("tokens", true);
+  prefs.begin("tokens", false);
   for (uint8_t i = 0; i < MAX_API_TOKENS; i++) {
     String v = prefs.getString(("t"+String(i)).c_str(), "");
     strncpy(apiTokens[i], v.c_str(), API_TOKEN_LEN);
@@ -633,13 +734,14 @@ void stopChannel(uint8_t ch) {
     channels[ch].lastStopMs = millis();
     uint32_t elapsed = (millis() - channels[ch].startMs) / 1000;
     logEvent(ch, "STOP", (uint16_t)elapsed, "manual");
-    Serial.printf("[%s] STOP (%lus)\n", channelName(ch).c_str(), (unsigned long)elapsed);
+    serialLogf("[%s] STOP (%lus)\n", channelName(ch).c_str(), (unsigned long)elapsed);
   }
   channels[ch].active = false;
+  clearActiveChannelNVS();
 }
 
-void stopAllChannels() { 
-  for (uint8_t i = 0; i < 8; i++) stopChannel(i); 
+void stopAllChannels() {
+  for (uint8_t i = 0; i < 8; i++) stopChannel(i);
 }
 
 bool startChannel(uint8_t ch, uint16_t durationSec) {
@@ -656,7 +758,8 @@ bool startChannel(uint8_t ch, uint16_t durationSec) {
   channels[ch].startMs    = millis();
   channels[ch].durationMs = (uint32_t)durationSec * 1000UL;
   logEvent(ch, "START", durationSec, "manual");
-  Serial.printf("[%s] START für %u s\n", channelName(ch).c_str(), durationSec);
+  saveActiveChannelToNVS();
+  serialLogf("[%s] START für %u s\n", channelName(ch).c_str(), durationSec);
   return true;
 }
 
@@ -669,14 +772,66 @@ void enqueueTask(uint8_t ch, uint16_t durationSec, const char* source = "plan") 
   if (ch >= 8) return;
   if (durationSec == 0 || durationSec > MAX_RUNTIME_SEC) return;
   taskQueue.push_back({ ch, durationSec });
+  saveQueueToNVS();
   logEvent(ch, "QUEUE", durationSec, source);
-  Serial.printf("[QUEUE] +%s %us (size=%u)\n",
+  serialLogf("[QUEUE] +%s %us (size=%u)\n",
                 channelName(ch).c_str(), durationSec, (unsigned)taskQueue.size());
 }
 
-void clearQueue() {
+// ============================================================
+// ================== QUEUE-PERSISTENZ ========================
+// ============================================================
+
+struct QueueNVS {
+  uint8_t  cnt;
+  uint8_t  ch[64];
+  uint16_t sec[64];
+};
+
+void saveQueueToNVS() {
+  QueueNVS q;
+  q.cnt = (uint8_t)min(taskQueue.size(), (size_t)64);
+  for (uint8_t i = 0; i < q.cnt; i++) {
+    q.ch[i]  = taskQueue[i].channel;
+    q.sec[i] = taskQueue[i].durationSec;
+  }
+  prefs.begin("queue", false);
+  prefs.putBytes("q", &q, sizeof(q));
+  prefs.end();
+}
+
+void loadQueueFromNVS() {
+  QueueNVS q;
+  prefs.begin("queue", true);
+  size_t sz = prefs.getBytesLength("q");
+  if (sz == sizeof(q)) prefs.getBytes("q", &q, sizeof(q));
+  else                 q.cnt = 0;
+  prefs.end();
+  taskQueue.clear();
+  for (uint8_t i = 0; i < q.cnt && i < 64; i++) {
+    if (q.ch[i] < 8 && q.sec[i] > 0 && q.sec[i] <= MAX_RUNTIME_SEC)
+      taskQueue.push_back({ q.ch[i], q.sec[i] });
+  }
+  if (!taskQueue.empty()) {
+    queueRestoredFromNVS = true;
+    queuePaused = true;
+    serialLogf("[QUEUE] %u Aufgaben aus NVS wiederhergestellt – warte auf Taste\n",
+               (unsigned)taskQueue.size());
+  }
+}
+
+// ============================================================
+
+void clearQueue(const char* source) {
+  if (taskQueue.empty()) {
+    serialLog("[QUEUE] bereits leer");
+    return;
+  }
   while (!taskQueue.empty()) taskQueue.pop_front();
-  Serial.println("[QUEUE] geleert");
+  queuePaused = false;
+  saveQueueToNVS();
+  serialLog("[QUEUE] geleert");
+  logEvent(0, "QUEUE_CLEAR", 0, source);
 }
 
 void processQueue() {
@@ -684,13 +839,66 @@ void processQueue() {
     if (channels[i].active &&
         (millis() - channels[i].startMs) >= channels[i].durationMs)
       stopChannel(i);
+  if (queuePaused) return;
   if (SINGLE_CHANNEL_MODE && anyChannelActive()) return;
   if (taskQueue.empty()) return;
   WateringTask t = taskQueue.front();
   if (channels[t.channel].lastStopMs &&
       (millis() - channels[t.channel].lastStopMs) < (uint32_t)MIN_GAP_SEC * 1000UL) return;
   taskQueue.pop_front();
+  saveQueueToNVS();
   startChannel(t.channel, t.durationSec);
+}
+
+// ============================================================
+// ========= AKTIVER-KANAL-PERSISTENZ (Stromausfall) ==========
+// ============================================================
+
+// Minimale Restzeit für Wiederherstellung (< 30 s lohnt sich nicht)
+static const uint16_t MIN_RESTORE_SEC = 30;
+
+void saveActiveChannelToNVS() {
+  prefs.begin("active", false);
+  bool saved = false;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (!channels[i].active) continue;
+    uint32_t elapsed = millis() - channels[i].startMs;
+    uint32_t remMs   = (channels[i].durationMs > elapsed) ? (channels[i].durationMs - elapsed) : 0;
+    uint32_t remS32  = remMs / 1000UL;
+    if (remS32 > MAX_RUNTIME_SEC) remS32 = MAX_RUNTIME_SEC;
+    uint16_t remSec  = (uint16_t)remS32;
+    prefs.putUChar("ch",  i);
+    prefs.putUShort("rem", remSec);
+    saved = true;
+    break;  // SINGLE_CHANNEL_MODE: nur ein Kanal aktiv
+  }
+  if (!saved) {
+    prefs.putUChar("ch",  0xFF);
+    prefs.putUShort("rem", 0);
+  }
+  prefs.end();
+}
+
+void clearActiveChannelNVS() {
+  prefs.begin("active", false);
+  prefs.putUChar("ch",  0xFF);
+  prefs.putUShort("rem", 0);
+  prefs.end();
+}
+
+void loadActiveChannelFromNVS() {
+  prefs.begin("active", true);
+  uint8_t  ch  = prefs.getUChar("ch",  0xFF);
+  uint16_t rem = prefs.getUShort("rem", 0);
+  prefs.end();
+  clearActiveChannelNVS();  // direkt löschen — nach dem Lesen nicht mehr benötigt
+
+  if (ch < 8 && rem >= MIN_RESTORE_SEC) {
+    taskQueue.push_front({ ch, rem });
+    queuePaused          = true;
+    queueRestoredFromNVS = true;
+    serialLogf("[ACTIVE] Kanal %u: %us Restzeit wiederhergestellt (vorne in Queue)\n", ch + 1, rem);
+  }
 }
 
 // ============================================================
@@ -704,7 +912,7 @@ void winterBeginBlow() {
   channels[winterChannel].durationMs = (uint32_t)WINTER_BLOW_SEC * 1000UL;
   winterPhase = WP_BLOW; winterPhaseStart = millis();
   logEvent(winterChannel, "BLOW", WINTER_BLOW_SEC, "winter");
-  Serial.printf("[WINTER] Blow %s (%u/%u)\n", channelName(winterChannel).c_str(), winterPass, WINTER_PASSES);
+  serialLogf("[WINTER] Blow %s (%u/%u)\n", channelName(winterChannel).c_str(), winterPass, WINTER_PASSES);
 }
 
 void startWinterization() {
@@ -761,7 +969,7 @@ void saveGroups() {
 }
 
 void loadGroups() {
-  prefs.begin("irrig", true);
+  prefs.begin("irrig", false);
   size_t sz = prefs.getBytesLength("groups");
   if (sz == sizeof(groups)) prefs.getBytes("groups", groups, sizeof(groups));
   else                       memset(groups, 0, sizeof(groups));
@@ -775,7 +983,7 @@ void loadGroups() {
 }
 
 void loadWifiCreds() {
-  prefs.begin("wifi", true);
+  prefs.begin("wifi", false);
   String s = prefs.getString("ssid", ""); 
   String p = prefs.getString("pass", "");
   prefs.end();
@@ -785,7 +993,7 @@ void loadWifiCreds() {
   if (p.length() >= PASS_MIN_LEN && p.length() <= PASS_MAX_LEN) strncpy(staPass, p.c_str(), sizeof(staPass)-1);
   else strncpy(staPass, WIFI_PASS, sizeof(staPass)-1);
   staPass[sizeof(staPass)-1] = '\0';
-  Serial.printf("[WiFi] STA-SSID: '%s'\n", staSsid);
+  serialLogf("[WiFi] STA-SSID: '%s'\n", staSsid);
 }
 
 void saveWifiCreds(const String& ssid, const String& pass) {
@@ -796,7 +1004,7 @@ void saveWifiCreds(const String& ssid, const String& pass) {
 }
 
 void loadChannelNames() {
-  prefs.begin("names", true);
+  prefs.begin("names", false);
   for (uint8_t i = 0; i < 8; i++) {
     String v = prefs.getString(("ch"+String(i)).c_str(), "");
     strncpy(channelNames[i], v.c_str(), CH_NAME_MAX);
@@ -816,10 +1024,10 @@ void saveChannelName(uint8_t i, const String& name) {
 }
 
 void loadRelayPolarity() {
-  prefs.begin("relay", true);
+  prefs.begin("relay", false);
   relayActiveLow = prefs.getBool("activeLow", RELAY_ACTIVE_LOW_DEFAULT);
   prefs.end();
-  Serial.printf("[RELAY] activeLow=%d\n", relayActiveLow ? 1 : 0);
+  serialLogf("[RELAY] activeLow=%d\n", relayActiveLow ? 1 : 0);
 }
 
 void saveRelayPolarity(bool activeLow) {
@@ -827,6 +1035,41 @@ void saveRelayPolarity(bool activeLow) {
   prefs.putBool("activeLow", activeLow);
   prefs.end();
   relayActiveLow = activeLow;
+}
+
+// ============================================================
+// =================== MISC-KONFIGURATION =====================
+// ============================================================
+
+void loadMiscConfig() {
+  prefs.begin("misc", true);
+  String tz = prefs.getString("tz", TZ_DEFAULT);
+  strncpy(tzString, tz.c_str(), TZ_STRING_MAX);
+  tzString[TZ_STRING_MAX] = '\0';
+  waterImpulsesPerLiter = prefs.getUInt("wipl", WATER_IPL_DEFAULT);
+#if WATER_METER_ENABLED
+  waterPulseCount = prefs.getUInt("wpc", 0);
+#endif
+  prefs.end();
+  serialLogf("[MISC] TZ=%s  IPL=%u\n", tzString, (unsigned)waterImpulsesPerLiter);
+}
+
+void saveMiscConfig(const String& tz, uint32_t ipl) {
+  strncpy(tzString, tz.c_str(), TZ_STRING_MAX);
+  tzString[TZ_STRING_MAX] = '\0';
+  waterImpulsesPerLiter = ipl;
+  prefs.begin("misc", false);
+  prefs.putString("tz", tz);
+  prefs.putUInt("wipl", ipl);
+  prefs.end();
+}
+
+void saveWaterCounter() {
+#if WATER_METER_ENABLED
+  prefs.begin("misc", false);
+  prefs.putUInt("wpc", (uint32_t)waterPulseCount);
+  prefs.end();
+#endif
 }
 
 // ============================================================
@@ -841,18 +1084,40 @@ void checkGroups() {
   if (ti.tm_year <= 0) return;
   uint8_t  dayBit = 1 << ti.tm_wday;
   uint32_t today  = (ti.tm_year+1900)*10000UL + (ti.tm_mon+1)*100UL + ti.tm_mday;
-  uint16_t nowMin = ti.tm_hour*60 + ti.tm_min;
+  uint16_t nowMin = (uint16_t)(ti.tm_hour * 60 + ti.tm_min);
+
+  // Sliding-Window für korrekte Zeitumstellungs-Behandlung:
+  // Prüft ob die geplante Zeit im Intervall (prevMin, nowMin] liegt.
+  // Vorwärts-Umstellung (z.B. 1:59→3:00): Fenster überbrückt die übersprungene Stunde.
+  // Rückwärts-Umstellung: lastRunDay-Guard verhindert Doppelausführung.
+  static uint16_t prevMin = 0xFFFF;
+  static uint32_t prevDay = 0;
+  bool newDay = (prevDay != today);
+  if (newDay) { prevDay = today; }
+
   for (uint8_t g = 0; g < MAX_GROUPS; g++) {
     Group &G = groups[g];
     if (!G.enabled || G.stepCount == 0) continue;
     if (!(G.daysMask & dayBit)) continue;
-    if (G.hour != ti.tm_hour || G.minute != ti.tm_min) continue;
-    if (G.lastRunDay == today && G.lastRunMin == nowMin) continue;
+    if (G.monthsMask != 0 && !(G.monthsMask & (1u << ti.tm_mon))) continue;
+
+    uint16_t schMin = (uint16_t)(G.hour * 60 + G.minute);
+
+    // Liegt schMin im Prüffenster?
+    bool inWindow = newDay ? (schMin <= nowMin)
+                           : (schMin > prevMin && schMin <= nowMin);
+    if (!inWindow) continue;
+
+    // Heute bereits ausgeführt → kein zweiter Lauf (Rückwärts-Umstellung)
+    if (G.lastRunDay == today) continue;
+
     for (uint8_t k = 0; k < G.stepCount; k++)
       enqueueTask(G.steps[k].channel, G.steps[k].durationSec, "plan");
-    G.lastRunDay = today; G.lastRunMin = nowMin;
-    Serial.printf("[GROUP %u] '%s' getriggert (%u Schritte)\n", g, groupLabel(g).c_str(), G.stepCount);
+    G.lastRunDay = today; G.lastRunMin = schMin;
+    serialLogf("[GROUP %u] '%s' getriggert (%u Schritte)\n", g, groupLabel(g).c_str(), G.stepCount);
   }
+
+  prevMin = nowMin;
 }
 
 // ============================================================
@@ -860,7 +1125,7 @@ void checkGroups() {
 // ============================================================
 
 String buildExport() {
-  String s = "# IrrigationController config v3 (ohne WLAN-Passwort)\n";
+  String s = "# IrrigationController config v4 (ohne WLAN-Passwort)\n";
   s += "WIFI|" + String(staSsid) + "\n";
   for (int i = 0; i < 8; i++)
     if (channelNames[i][0]) s += "NAME|" + String(i) + "|" + String(channelNames[i]) + "\n";
@@ -868,7 +1133,8 @@ String buildExport() {
     Group &G = groups[g];
     if (!G.enabled && G.stepCount == 0 && !G.name[0]) continue;
     s += "GROUP|" + String(g) + "|" + String(G.enabled?1:0) + "|" + String(G.hour) + "|" +
-         String(G.minute) + "|" + String(G.daysMask) + "|" + String(G.name) + "\n";
+         String(G.minute) + "|" + String(G.daysMask) + "|" + String(G.name) +
+         "|" + String(G.monthsMask) + "\n";
     for (uint8_t k = 0; k < G.stepCount; k++)
       s += "STEP|" + String(g) + "|" + String(G.steps[k].channel) + "|" + String(G.steps[k].durationSec) + "\n";
   }
@@ -906,14 +1172,15 @@ int applyImport(const String& txt) {
       int g = getField(line,1).toInt();
       if (g < 0 || g >= MAX_GROUPS) continue;
       Group &G = groups[g];
-      G.enabled  = getField(line,2).toInt() != 0;
-      G.hour     = (uint8_t) constrain(getField(line,3).toInt(), 0, 23);
-      G.minute   = (uint8_t) constrain(getField(line,4).toInt(), 0, 59);
-      G.daysMask = (uint8_t)(getField(line,5).toInt() & 0x7F);
-      String nm  = sanitizeField(getField(line,6), GROUP_NAME_MAX);
-      strncpy(G.name, nm.c_str(), GROUP_NAME_MAX); 
+      G.enabled    = getField(line,2).toInt() != 0;
+      G.hour       = (uint8_t) constrain(getField(line,3).toInt(), 0, 23);
+      G.minute     = (uint8_t) constrain(getField(line,4).toInt(), 0, 59);
+      G.daysMask   = (uint8_t)(getField(line,5).toInt() & 0x7F);
+      String nm    = sanitizeField(getField(line,6), GROUP_NAME_MAX);
+      strncpy(G.name, nm.c_str(), GROUP_NAME_MAX);
       G.name[GROUP_NAME_MAX] = '\0';
-      G.stepCount = 0;
+      G.monthsMask = (uint16_t)(getField(line,7).toInt() & 0x0FFF);
+      G.stepCount  = 0;
       applied++;
     } else if (line.startsWith("STEP|")) {
       int g = getField(line,1).toInt();
@@ -940,9 +1207,9 @@ int applyImport(const String& txt) {
 void startMDNS() {
   if (MDNS.begin(DEVICE_HOSTNAME)) { 
     MDNS.addService("http","tcp",80); 
-    Serial.printf("[mDNS] %s.local\n", DEVICE_HOSTNAME); 
+    serialLogf("[mDNS] %s.local\n", DEVICE_HOSTNAME); 
   }
-  else Serial.println("[mDNS] Start fehlgeschlagen");
+  else serialLog("[mDNS] Start fehlgeschlagen");
 }
 
 void wifiBeginSTA() {
@@ -951,14 +1218,14 @@ void wifiBeginSTA() {
   WiFi.setHostname(DEVICE_HOSTNAME);
   WiFi.setAutoReconnect(true);
   WiFi.begin(staSsid, staPass);
-  Serial.printf("[WiFi] Verbinde mit %s ", staSsid);
+  serialLogf("[WiFi] Verbinde mit %s ", staSsid);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis()-t0 < 15000) { delay(250); Serial.print("."); }
   if (WiFi.status() == WL_CONNECTED) { 
-    Serial.printf("\n[WiFi] OK IP=%s\n", WiFi.localIP().toString().c_str()); 
+    serialLogf("\n[WiFi] OK IP=%s\n", WiFi.localIP().toString().c_str()); 
     startMDNS(); 
   }
-  else Serial.println("\n[WiFi] FEHLGESCHLAGEN");
+  else serialLog("\n[WiFi] FEHLGESCHLAGEN");
   currentMode = OP_STA;
 }
 
@@ -968,7 +1235,7 @@ void wifiStartAP() {
   WiFi.softAP(AP_SSID, AP_PASS);
   currentMode = OP_AP;
   dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-  Serial.printf("[AP] IP=%s\n", WiFi.softAPIP().toString().c_str());
+  serialLogf("[AP] IP=%s\n", WiFi.softAPIP().toString().c_str());
 }
 
 void maintainWifi() {
@@ -981,7 +1248,7 @@ void maintainWifi() {
   
   if (millis() - lastWifiReconnectAttempt > WIFI_RECONNECT_RETRY_MS) {
     lastWifiReconnectAttempt = millis();
-    Serial.println("[WiFi] Reconnect-Versuch (nach Timeout)");
+    serialLog("[WiFi] Reconnect-Versuch (nach Timeout)");
     WiFi.disconnect(false);
     WiFi.begin(staSsid, staPass);
   }
@@ -992,13 +1259,45 @@ void maintainWifi() {
 // ============================================================
 
 void initTime() {
-  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  // Korrekte DST-Behandlung über POSIX-TZ-String
+  const char* tz = (tzString[0] != '\0') ? tzString : TZ_DEFAULT;
+  configTzTime(tz, NTP_SERVER);
   struct tm ti;
-  if (getLocalTime(&ti, 8000)) { 
-    ntpSynced = true; 
-    Serial.println("[NTP] sync"); 
+  if (getLocalTime(&ti, 8000)) {
+    ntpSynced = true;
+    serialLog("[NTP] sync");
   }
-  else Serial.println("[NTP] noch nicht sync");
+  else if (!rtcSynced && setSystemTimeFromRtc()) {
+    rtcSynced = true;
+    serialLog("[RTC] Systemzeit gesetzt aus RTC");
+  }
+  else if (rtcSynced) {
+    serialLog("[RTC] Systemzeit bereits aus RTC gesetzt");
+  }
+  else {
+    serialLog("[NTP] noch nicht sync");
+  }
+}
+
+// ============================================================
+// =================== WASSERZÄHLER ===========================
+// ============================================================
+
+#if WATER_METER_ENABLED
+void IRAM_ATTR waterPulseISR() {
+  waterPulseCount++;
+}
+#endif
+
+// Liter aus Gesamtzähler berechnen
+float waterLiters() {
+#if WATER_METER_ENABLED
+  return (waterImpulsesPerLiter > 0)
+         ? (float)waterPulseCount / (float)waterImpulsesPerLiter
+         : 0.0f;
+#else
+  return 0.0f;
+#endif
 }
 
 // ============================================================
@@ -1065,7 +1364,8 @@ void updateStatusDisplay() {
       strncpy(buf, ph, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
     }
     u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
-    snprintf(buf, sizeof(buf), "Rest: %lus", (unsigned long)winterPhaseRemainingSec());
+    uint32_t wrem = winterPhaseRemainingSec();
+    snprintf(buf, sizeof(buf), "Rest: %02lu:%02lu:%02lu", wrem / 3600, (wrem % 3600) / 60, wrem % 60);
     u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
     snprintf(buf, sizeof(buf), "kumRun: %us", winterCumRunSec);
     u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf);
@@ -1073,7 +1373,7 @@ void updateStatusDisplay() {
     return;
   }
 
-  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print("Bewaesserung ESP32"); y += FONT_LINE_H;
+  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print("= Bewässerung ESP32 ="); y += FONT_LINE_H;
 
   if (WiFi.status() == WL_CONNECTED) {
     snprintf(buf, sizeof(buf), "%s [%d%%]", WiFi.localIP().toString().c_str(), getWifiSignalQuality());
@@ -1088,12 +1388,29 @@ void updateStatusDisplay() {
   for (uint8_t i = 0; i < 8; i++) {
     if (channels[i].active) {
       uint32_t rem = (channels[i].durationMs - (millis() - channels[i].startMs)) / 1000;
-      snprintf(buf, sizeof(buf), "%.8s %lus", channelShort(i).c_str(), (unsigned long)rem);
-      u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
+      // Kanalname linksbündig, Restzeit rechtsbündig
+      char timeBuf[9];
+      snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02lu:%02lu", rem / 3600, (rem % 3600) / 60, rem % 60);
+      int timeW = (int)strlen(timeBuf) * 6;
+      u8g2.setCursor(0, y + FONT_ASCENT);
+      u8g2.print(channelShort(i));
+      u8g2.setCursor(OLED_WIDTH - timeW, y + FONT_ASCENT);
+      u8g2.print(timeBuf);
+      y += FONT_LINE_H;
       any = true;
     }
   }
-  if (!any) { u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print("Alle Kanaele aus"); y += FONT_LINE_H; }
+  if (!any) {
+    u8g2.setCursor(0, y + FONT_ASCENT);
+#if WATER_METER_ENABLED
+    char wbuf[20];
+    snprintf(wbuf, sizeof(wbuf), "Aus  %.1fL", waterLiters());
+    u8g2.print(wbuf);
+#else
+    u8g2.print("Alle Kanale aus");
+#endif
+    y += FONT_LINE_H;
+  }
 
   snprintf(buf, sizeof(buf), "Queue: %u", (unsigned)taskQueue.size());
   u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf);
@@ -1180,32 +1497,41 @@ pre{white-space:pre-wrap;background:var(--panel2);padding:10px;border-radius:8px
 a.btnlink{display:inline-block;text-decoration:none;color:var(--bg);background:var(--accent);padding:10px 16px;border-radius:8px;font-weight:600}
 )CSS";
 
+static const char FAVICON_SVG[] PROGMEM = R"SVG(
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+<path fill="#3fb950" d="M50 8C50 8 12 48 12 65C12 84 29 97 50 97C71 97 88 84 88 65C88 48 50 8 50 8Z"/>
+<path fill="#0d1117" d="M50 55C43 55 37 60 37 67C37 74 43 79 50 79"/>
+</svg>
+)SVG";
+
 static const char STATUS_SCRIPT[] PROGMEM = R"JS(
 <script>
 function esc(s){return (''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+function fmtS(s){s=+s;var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
+ return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0')}
 async function refreshStatus(){
  try{
   const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;const d=await r.json();
   const ov=document.getElementById('overview');
   if(ov){
-   const act=d.channels.filter(c=>c.active).map(c=>esc(c.name)+' '+c.remaining_s+'s');
+   const act=d.channels.filter(c=>c.active).map(c=>esc(c.name)+' '+fmtS(c.remaining_s));
    let l=['Gerät: '+esc(d.host),'Zeit: '+esc(d.time)];
    let wifi='WLAN: '+(d.ip?esc(d.ip):'offline')+' ['+(d.signal_quality||0)+'%]';
    l.push(wifi);
    l.push('Aktiv: '+(act.length?act.join(', '):'keine'));
    if(d.queue_items&&d.queue_items.length)l.push('Queue: '+d.queue+' — '+d.queue_items.map(it=>esc(it.name)+' '+Math.round(it.sec/60)+'min').join(' → '));
    else l.push('Queue: '+d.queue);
-   if(d.winter&&d.winter.active)l.push('WINTER: Zone '+d.winter.channel+' '+esc(d.winter.phase)+' '+d.winter.remaining_s+'s');
+   if(d.winter&&d.winter.active)l.push('WINTER: Zone '+d.winter.channel+' '+esc(d.winter.phase)+' '+fmtS(d.winter.remaining_s));
    ov.innerHTML=l.map(x=>'<div>'+x+'</div>').join('');
   }
   const qt=document.getElementById('queue-table');
   if(qt&&d.queue_items){
    let h='<tr><td style="font-weight:600">Kanal</td><td style="font-weight:600">Dauer</td></tr>';
-   d.queue_items.forEach(it=>{h+='<tr><td>'+esc(it.name)+'</td><td>'+it.sec+'s</td></tr>';});
+   d.queue_items.forEach(it=>{h+='<tr><td>'+esc(it.name)+'</td><td>'+fmtS(it.sec)+'</td></tr>';});
    qt.innerHTML=h;
   }
   d.channels.forEach((c,i)=>{const e=document.getElementById('ch-status-'+i);
-   if(e)e.textContent=c.active?('AN · '+c.remaining_s+'s'):'aus';});
+   if(e)e.textContent=c.active?('AN · '+fmtS(c.remaining_s)):'aus';});
  }catch(e){}
 }
 setInterval(refreshStatus,3000);refreshStatus();
@@ -1218,7 +1544,8 @@ String navLink(const String& href, const String& label, bool active) {
 
 String pageHead(const String& title, const String& active) {
   String h = "<!doctype html><html lang='de'><head><meta charset='utf-8'>";
-  h += "<meta name='viewport' content='width=device-width,initial-scale=1'><title>"+title+"</title><style>";
+  h += "<meta name='viewport' content='width=device-width,initial-scale=1'><title>"+title+"</title>";
+  h += "<link rel='icon' type='image/svg+xml' href='/favicon.svg'><style>";
   h += themeRoot(); 
   h += FPSTR(STYLE_BASE); 
   h += "</style></head><body><div class='wrap'>";
@@ -1297,7 +1624,7 @@ String buildHome() {
   h += "<div>Gerät: " + String(DEVICE_HOSTNAME) + "</div>";
   h += "<div>Zeit: " + nowTimeStr() + "</div>";
   h += "<div>WLAN: " + buildWifiStatusWithQuality() + "</div>";
-  h += "</div></div></div>";
+  h += "</div></div>";
 
   if (winterActive)
     h += "<div class='card'><span class='warn'>Winter-Entwässerung aktiv</span> – siehe Winter-Seite.</div>";
@@ -1385,6 +1712,15 @@ String buildPlans(const String& msg = "") {
     h += "<label><input type='checkbox' id='d"+String(order[k])+"' name='d"+String(order[k])+"' checked>"+String(labels[k])+"</label>";
   h += "</div></div>";
 
+  h += "<div class='row'><label>Monate</label><div class='days'>";
+  const char* monLbl[12] = {"Jan","Feb","Mär","Apr","Mai","Jun","Jul","Aug","Sep","Okt","Nov","Dez"};
+  // Vorauswahl: Mai(4), Jun(5), Jul(6), Aug(7)
+  const bool monDefault[12] = {false,false,false,false,true,true,true,true,false,false,false,false};
+  for (uint8_t m = 0; m < 12; m++)
+    h += "<label><input type='checkbox' id='mo"+String(m)+"' name='mo"+String(m)+"'" +
+         (monDefault[m] ? " checked" : "") + ">" + String(monLbl[m]) + "</label>";
+  h += "</div></div>";
+
   h += "<h2 class='mt'>Schritte (Reihenfolge = Abarbeitung)</h2>";
   for (uint8_t k = 0; k < MAX_STEPS; k++) {
     h += "<div class='step'><span class='snum'>" + String(k+1) + ".</span>" +
@@ -1401,14 +1737,24 @@ String buildPlans(const String& msg = "") {
     any = true;
     char t[8]; 
     snprintf(t,8,"%02u:%02u", G.hour, G.minute);
+    // Monatsanzeige
+    String monStr;
+    if (G.monthsMask == 0 || G.monthsMask == 0x0FFF) { monStr = "alle Monate"; }
+    else {
+      const char* ml[12] = {"Jan","Feb","Mär","Apr","Mai","Jun","Jul","Aug","Sep","Okt","Nov","Dez"};
+      for (uint8_t m = 0; m < 12; m++) if (G.monthsMask & (1u<<m)) { if (monStr.length()) monStr+=","; monStr+=ml[m]; }
+    }
     h += "<div class='grp'>[" + String(g) + "] " + htmlEscape(groupLabel(g)) +
-         " · " + String(t) + " · [" + daysMaskToStr(G.daysMask) + "] · " +
+         " · " + String(t) + " · [" + daysMaskToStr(G.daysMask) + "] · [" + monStr + "] · " +
          (G.enabled ? "aktiv" : "<span class='warn'>inaktiv</span>") + "</div><pre>";
     if (G.stepCount == 0) h += "(keine Schritte)";
     for (uint8_t k = 0; k < G.stepCount; k++)
       h += String(k+1) + ". " + htmlEscape(channelName(G.steps[k].channel)) +
            " — " + String(G.steps[k].durationSec/60) + " min\n";
     h += "</pre>";
+    h += "<form action='/rungroup' method='POST' style='margin:4px 0 8px'>"
+         "<input type='hidden' name='slot' value='" + String(g) + "'>"
+         "<button type='submit'>&#9654; Jetzt starten</button></form>";
   }
   if (!any) h += "<pre>(keine Gruppen)</pre>";
   h += "<form action='/cleargroup' method='POST' class='mt'><div class='row'><label>Gruppe löschen</label>"
@@ -1424,7 +1770,8 @@ String buildPlans(const String& msg = "") {
     nm.replace("\\","\\\\"); 
     nm.replace("'","\\'");
     data += "{en:" + String(G.enabled?1:0) + ",name:'" + nm + "',h:" + String(G.hour) +
-            ",m:" + String(G.minute) + ",days:" + String(G.daysMask) + ",steps:[";
+            ",m:" + String(G.minute) + ",days:" + String(G.daysMask) +
+            ",months:" + String(G.monthsMask) + ",steps:[";
     for (uint8_t k = 0; k < G.stepCount; k++) {
       if (k) data += ",";
       data += "{ch:" + String(G.steps[k].channel) + ",sec:" + String(G.steps[k].durationSec) + "}";
@@ -1441,6 +1788,7 @@ function loadGroup(){
  document.getElementById('h').value=g.h;
  document.getElementById('m').value=g.m;
  for(var d=0;d<7;d++){var e=document.getElementById('d'+d);if(e)e.checked=!!(g.days&(1<<d));}
+ for(var m=0;m<12;m++){var e=document.getElementById('mo'+m);if(e)e.checked=g.months===0?(m>=4&&m<=7):!!(g.months&(1<<m));}
  for(var k=0;k<MAXSTEPS;k++){
   var ce=document.getElementsByName('s'+k+'ch')[0];
   var se=document.getElementsByName('s'+k+'sec')[0];
@@ -1466,7 +1814,7 @@ String buildConfig(const String& msg = "") {
   if (rtcPresent) h += "<div class='muted'>RTC: " + getRtcTimeStr() + "</div>";
   h += "<div class='muted mt'>WLAN-Zugangsdaten nur im AP-Konfig-Modus änderbar (BOOT-Taste 3 s).</div></div>";
 
-  h += "<div class='card'><h2>Kanalnamen</h2><form action='/setnames' method='POST'>";
+  h += "<div class='card'><h2>Kanalnamen</h2><form action='/setnames' method='POST' style='--lblw:80px'>";
   for (uint8_t i = 0; i < 8; i++)
     h += "<div class='row'><label>Kanal " + String(i+1) + "</label>"
          "<input type='text' name='ch" + String(i) + "' maxlength='" + String(CH_NAME_MAX) +
@@ -1520,12 +1868,46 @@ String buildConfig(const String& msg = "") {
   }
   h += "</div>";
 
+  // --- Zeitzone ---
+  h += "<div class='card'><h2>Zeitzone (Sommer-/Winterzeit)</h2><form action='/settz' method='POST'>";
+  h += "<div class='row'><label>POSIX-TZ</label>"
+       "<input type='text' name='tz' maxlength='" + String(TZ_STRING_MAX) + "' value='" +
+       htmlEscape(String(tzString[0] ? tzString : TZ_DEFAULT)) + "' "
+       "placeholder='CET-1CEST,M3.5.0,M10.5.0/3'></div>";
+  h += "<p class='muted'>Standard CET/CEST (Mitteleuropa): <code>CET-1CEST,M3.5.0,M10.5.0/3</code></p>";
+  h += "<div class='btns'><button type='submit'>Zeitzone speichern</button></div></form></div>";
+
+  // --- Wasserzähler ---
+  h += "<div class='card'><h2>Wasserzähler</h2>";
+#if WATER_METER_ENABLED
+  h += "<p class='muted'>GPIO " + String(PIN_WATER_METER) + " aktiv. "
+       "Gesamtzähler: <b>" + String(waterLiters(), 1) + " L</b> (" +
+       String((unsigned long)(waterPulseCount)) + " Impulse)</p>";
+#else
+  h += "<p class='muted'>Deaktiviert (<code>#define WATER_METER_ENABLED 1</code> in main.cpp).</p>";
+#endif
+  h += "<form action='/water/config' method='POST'>";
+  h += "<div class='row'><label>Impulse/Liter</label><select name='ipl'>";
+  const uint32_t iplOpts[] = {1, 10, 100, 1000};
+  for (uint8_t i = 0; i < 4; i++) {
+    h += "<option value='" + String(iplOpts[i]) + "'" +
+         (waterImpulsesPerLiter == iplOpts[i] ? " selected" : "") + ">" +
+         String(iplOpts[i]) + "</option>";
+  }
+  h += "</select></div>";
+  h += "<div class='btns'><button type='submit'>Speichern</button>";
+#if WATER_METER_ENABLED
+  h += "<form action='/water/reset' method='POST' style='display:inline'>"
+       "<button class='stop' type='submit'>Zähler zurücksetzen</button></form>";
+#endif
+  h += "</div></form></div>";
+
   h += "<div class='card'><h2>Konfiguration sichern</h2>";
   h += "<p class='muted'>Export/Import: Kanalnamen, Gruppen-Pläne, SSID (ohne Passwort).</p>";
   h += "<a class='btnlink' href='/export'>Export herunterladen</a>";
   h += "<form action='/import' method='POST' class='mt'>"
        "<label class='muted'>Import:</label>"
-       "<textarea name='cfg' placeholder='# IrrigationController config v3 ...'></textarea>"
+       "<textarea name='cfg' placeholder='# IrrigationController config v4 ...'></textarea>"
        "<div class='btns'><button type='submit'>Import anwenden</button></div></form></div>";
 
   h += pageFoot(false);
@@ -1666,7 +2048,7 @@ void handleStart() {
   // Wenn SINGLE_CHANNEL_MODE aktiv und ein Kanal läuft → queueen
   if (SINGLE_CHANNEL_MODE && anyChannelActive()) {
     enqueueTask(ch, sec, "manual");
-    Serial.printf("[START] Kanal %u in Queue (bereits aktiv)\n", ch + 1);
+    serialLogf("[START] Kanal %u in Queue (bereits aktiv)\n", ch + 1);
   } else {
     // Sonst direkt starten
     startChannel(ch, sec);
@@ -1688,14 +2070,15 @@ void handleStopAll() {
   if (!checkAuth()) return;
   stopWinterization(); 
   stopAllChannels(); 
-  clearQueue();
+  clearQueue("notaus");
+  logEvent(0, "NOT-AUS", 0, "system");
   server.sendHeader("Location","/"); 
   server.send(303);
 }
 
 void handleQueueClear() {
   if (!checkAuth()) return;
-  clearQueue();
+  clearQueue("manual");
   server.sendHeader("Location","/queue"); 
   server.send(303);
 }
@@ -1774,6 +2157,9 @@ void handleSetGroup() {
   uint8_t mask = 0;
   for (int d = 0; d < 7; d++) if (server.hasArg("d"+String(d))) mask |= (1 << d);
   G.daysMask = mask;
+  uint16_t monMask = 0;
+  for (int m = 0; m < 12; m++) if (server.hasArg("mo"+String(m))) monMask |= (1u << m);
+  G.monthsMask = monMask;
   uint8_t cnt = 0;
   for (uint8_t k = 0; k < MAX_STEPS; k++) {
     String chKey = "s"+String(k)+"ch", secKey = "s"+String(k)+"sec";
@@ -1802,6 +2188,22 @@ void handleClearGroup() {
   groups[slot].name[GROUP_NAME_MAX] = '\0';
   saveGroups();
   server.send(200,"text/html; charset=utf-8", buildPlans("Gruppe " + String(slot+1) + " gelöscht."));
+}
+
+void handleRunGroup() {
+  if (!checkAuth()) return;
+  if (!server.hasArg("slot")) { server.send(400,"text/plain","missing slot"); return; }
+  uint8_t slot = (uint8_t)server.arg("slot").toInt();
+  if (slot >= MAX_GROUPS) { server.send(400,"text/plain","bad slot"); return; }
+  Group &G = groups[slot];
+  if (G.stepCount == 0) {
+    server.send(200,"text/html; charset=utf-8", buildPlans("Gruppe " + String(slot+1) + " hat keine Schritte."));
+    return;
+  }
+  for (uint8_t k = 0; k < G.stepCount; k++)
+    enqueueTask(G.steps[k].channel, G.steps[k].durationSec, "manual");
+  saveQueueToNVS();
+  server.send(200,"text/html; charset=utf-8", buildPlans("Gruppe " + String(slot+1) + " '" + htmlEscape(groupLabel(slot)) + "' gestartet (" + String(G.stepCount) + " Schritte in Queue)."));
 }
 
 void handleExport() {
@@ -1887,10 +2289,40 @@ void handleApiWinter() {
   server.send(200,"application/json","{\"ok\":true}");
 }
 
+void handleSetTZ() {
+  if (!checkAuth()) return;
+  String tz = server.hasArg("tz") ? server.arg("tz") : TZ_DEFAULT;
+  if (tz.length() == 0 || tz.length() > TZ_STRING_MAX) {
+    server.send(400,"text/html; charset=utf-8", buildConfig("Ungültiger TZ-String."));
+    return;
+  }
+  saveMiscConfig(tz, waterImpulsesPerLiter);
+  // TZ sofort anwenden
+  setenv("TZ", tzString, 1); tzset();
+  server.send(200,"text/html; charset=utf-8", buildConfig("Zeitzone gespeichert: " + tz));
+}
+
+void handleWaterConfig() {
+  if (!checkAuth()) return;
+  uint32_t ipl = server.hasArg("ipl") ? (uint32_t)server.arg("ipl").toInt() : WATER_IPL_DEFAULT;
+  if (ipl == 0) ipl = WATER_IPL_DEFAULT;
+  saveMiscConfig(String(tzString[0] ? tzString : TZ_DEFAULT), ipl);
+  server.send(200,"text/html; charset=utf-8", buildConfig("Impulse/Liter gespeichert: " + String(ipl)));
+}
+
+void handleWaterReset() {
+  if (!checkAuth()) return;
+#if WATER_METER_ENABLED
+  waterPulseCount = 0;
+  saveWaterCounter();
+#endif
+  server.send(200,"text/html; charset=utf-8", buildConfig("Wasserzähler zurückgesetzt."));
+}
+
 void handleNotFound() {
   if (currentMode == OP_AP) {
     if (AP_CONFIG_REQUIRE_AUTH && !checkWebAuthOnly()) return;
-    server.send(200,"text/html; charset=utf-8", buildApConfigHtml("")); 
+    server.send(200,"text/html; charset=utf-8", buildApConfigHtml(""));
     return;
   }
   server.send(404,"text/plain","Not found");
@@ -1919,12 +2351,18 @@ void setupWebRoutes() {
   server.on("/winter",       HTTP_POST, handleWinter);
   server.on("/setgroup",     HTTP_POST, handleSetGroup);
   server.on("/cleargroup",   HTTP_POST, handleClearGroup);
+  server.on("/rungroup",     HTTP_POST, handleRunGroup);
   server.on("/export",       HTTP_GET,  handleExport);
   server.on("/import",       HTTP_POST, handleImport);
+  server.on("/settz",        HTTP_POST, handleSetTZ);
+  server.on("/water/config", HTTP_POST, handleWaterConfig);
+  server.on("/water/reset",  HTTP_POST, handleWaterReset);
   server.on("/api/status",   HTTP_GET,  handleApiStatus);
   server.on("/api/start",    HTTP_POST, handleApiStart);
   server.on("/api/stop",     HTTP_POST, handleApiStop);
   server.on("/api/winter",   HTTP_POST, handleApiWinter);
+  server.on("/favicon.svg",  HTTP_GET,  []() { server.send(200, "image/svg+xml", FPSTR(FAVICON_SVG)); });
+  server.on("/favicon.ico",  HTTP_GET,  []() { server.sendHeader("Location", "/favicon.svg"); server.send(302); });
   server.onNotFound(handleNotFound);
   const char* hkeys[] = { "Authorization" };
   server.collectHeaders(hkeys, 1);
@@ -1936,26 +2374,93 @@ void setupWebRoutes() {
 
 void handleButton() {
   bool pressed = (digitalRead(PIN_AP_BUTTON) == LOW);
-  
+
   if (pressed) {
     lastButtonPress = millis();
-    
     if (buttonPressedSince == 0) {
       buttonPressedSince = millis();
-      Serial.println("[BTN] BOOT-Button gedrückt");
-    } 
-    else if (currentMode != OP_AP && millis() - buttonPressedSince > AP_BUTTON_HOLD_MS) {
-      Serial.println("[BTN] Long-Press -> AP-Modus");
-      stopWinterization(); 
-      stopAllChannels(); 
-      clearQueue();
-      wifiStartAP(); 
-      showQRCodeForAP();
+      serialLog("[BTN] BOOT-Button gedrückt");
+    } else if (currentMode != OP_AP && millis() - buttonPressedSince > AP_BUTTON_HOLD_MS) {
+      serialLog("[BTN] Long-Press -> AP-Modus");
+      stopWinterization(); stopAllChannels(); clearQueue();
+      wifiStartAP(); showQRCodeForAP();
     }
   } else {
+    // Kurzer Druck → Queue-Resume falls pausiert
+    if (buttonPressedSince > 0 && queuePaused) {
+      queuePaused = false;
+      serialLog("[BTN] Queue-Resume durch BOOT-Taste");
+    }
     buttonPressedSince = 0;
   }
 }
+
+// ============================================================
+// ================ EXTERNE TASTER-HANDLER ====================
+// ============================================================
+
+#if EXTERN_BRIGHTNESS_BUTTON
+void handleExternalBrightnessButton() {
+  static uint32_t lastDebounce = 0;
+  bool pressed = (digitalRead(PIN_BRIGHTNESS_BUTTON) == LOW);
+
+  if (pressed) {
+    if (extBtnPressedSince == 0) {
+      if (millis() - lastDebounce < 50) return;
+      extBtnPressedSince = millis();
+    }
+    lastButtonPress = millis();  // Display aktiv halten
+
+    if (!extBtnApTriggered && (millis() - extBtnPressedSince >= EXT_AP_HOLD_MS)) {
+      extBtnApTriggered = true;
+      serialLog("[BTN] Ext Long-Press -> AP-Modus");
+      stopWinterization(); stopAllChannels(); clearQueue();
+      wifiStartAP(); showQRCodeForAP();
+    }
+  } else {
+    if (extBtnPressedSince > 0) {
+      lastDebounce = millis();
+      uint32_t held = millis() - extBtnPressedSince;
+      if (!extBtnApTriggered) {
+        if (held < EXT_AP_HOLD_MS) {
+          // Kurzer Druck: Display hell + Queue-Resume
+          serialLog("[BTN] Ext Short-Press -> Display hell");
+          if (queuePaused) {
+            queuePaused = false;
+            serialLog("[BTN] Queue-Resume durch ext. Taster");
+          }
+        }
+      }
+      extBtnPressedSince = 0;
+      extBtnApTriggered  = false;
+    }
+  }
+}
+#endif
+
+#if EXTERN_ESTP_BUTTON
+void handleEmergencyButton() {
+  static uint32_t lastDebounce = 0;
+  bool pressed = (digitalRead(PIN_ESTP_BUTTON) == LOW);
+
+  if (pressed) {
+    if (estpPressedSince == 0) {
+      if (millis() - lastDebounce < 50) return;
+      estpPressedSince = millis();
+      serialLog("[ESTP] NOT-AUS gedrückt...");
+    } else if (millis() - estpPressedSince >= ESTP_HOLD_MS) {
+      serialLog("[ESTP] NOT-AUS ausgelöst — Neustart!");
+      stopWinterization(); stopAllChannels(); clearQueue();
+      logEvent(0, "ESTP_RESTART", 0, "hardware");
+      delay(500);
+      ESP.restart();
+    }
+  } else {
+    if (estpPressedSince > 0) lastDebounce = millis();
+    estpPressedSince = 0;
+  }
+}
+#endif
 
 // ============================================================
 // ===================== SETUP / LOOP =========================
@@ -1964,14 +2469,24 @@ void handleButton() {
 void setup() {
   Serial.begin(115200); 
   delay(200);
-  Serial.println("\n=== ESP32 Bewässerungssteuerung ===");
-  Serial.println("[INFO] WiFi Reconnect: 10s | Signal-Qualität | OLED Brightness");
+  Wire.begin(PIN_SDA, PIN_SCL);
+  initRTC();
+  if (setSystemTimeFromRtc()) {
+    rtcSynced = true;
+    serialLog("[RTC] Systemzeit aus RTC gesetzt");
+  }
+  serialLog("\n=== ESP32 Bewässerungssteuerung ===");
+  serialLog("[INFO] v4: TZ/DST | Monate | Queue-NVS | Ext.Taster | Wasserz.");
   #if EXTERN_BRIGHTNESS_BUTTON
-    Serial.println("[INFO] Externer Helligkeit-Taster: AKTIVIERT (GPIO " + String(PIN_BRIGHTNESS_BUTTON) + ")");
-  #else
-    Serial.println("[INFO] Externer Helligkeit-Taster: DEAKTIVIERT");
+    serialLog("[INFO] Ext. Helligkeits-/AP-Taster: GPIO " + String(PIN_BRIGHTNESS_BUTTON));
   #endif
-  
+  #if EXTERN_ESTP_BUTTON
+    serialLog("[INFO] NOT-AUS-Taster: GPIO " + String(PIN_ESTP_BUTTON));
+  #endif
+  #if WATER_METER_ENABLED
+    serialLog("[INFO] Wasserzähler: GPIO " + String(PIN_WATER_METER));
+  #endif
+
   for (uint8_t i = 0; i < 8; i++) {
     digitalWrite(CHANNEL_PINS[i], RELAY_ACTIVE_LOW_DEFAULT ? HIGH : LOW);
     pinMode(CHANNEL_PINS[i], OUTPUT);
@@ -1979,15 +2494,21 @@ void setup() {
     channels[i] = { false, 0, 0, 0 };
   }
   pinMode(PIN_AP_BUTTON, INPUT_PULLUP);
-  
+
   #if EXTERN_BRIGHTNESS_BUTTON
-    pinMode(PIN_BRIGHTNESS_BUTTON, INPUT_PULLUP);
+    pinMode(PIN_BRIGHTNESS_BUTTON, INPUT);  // GPIO 34 input-only, kein Pull-Up
+  #endif
+  #if EXTERN_ESTP_BUTTON
+    pinMode(PIN_ESTP_BUTTON, INPUT_PULLUP);
+  #endif
+  #if WATER_METER_ENABLED
+    pinMode(PIN_WATER_METER, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(PIN_WATER_METER), waterPulseISR, FALLING);
   #endif
 
-  Wire.begin(PIN_SDA, PIN_SCL);
   u8g2.setI2CAddress(OLED_ADDR << 1);
   if (!u8g2.begin()) {
-    Serial.println("[OLED] Init fehlgeschlagen");
+    serialLog("[OLED] Init fehlgeschlagen");
   } else {
     u8g2.enableUTF8Print();
     u8g2.setContrast(BRIGHTNESS_NORMAL);
@@ -1999,10 +2520,9 @@ void setup() {
     u8g2.setCursor(0, FONT_ASCENT + FONT_LINE_H);
     u8g2.print("startet...");
     u8g2.sendBuffer();
-    Serial.println("[OLED] OK, Helligkeit: 100%");
+    serialLog("[OLED] OK, Helligkeit: 100%");
   }
 
-  initRTC();
   initLogging();
   delay(100);
   logEvent(0, "SYSTEM_START", 0, "system");
@@ -2013,13 +2533,19 @@ void setup() {
   loadGroups();
   loadRelayPolarity();
   loadMqttConfig();
+  loadMiscConfig();
+  loadQueueFromNVS();
+  loadActiveChannelFromNVS();  // aktiver Kanal vor Queue-Einträgen einfügen
+  // TZ sofort anwenden (vor NTP-Sync)
+  setenv("TZ", tzString[0] ? tzString : TZ_DEFAULT, 1);
+  tzset();
 
   wifiBeginSTA();
-  if (WiFi.status() == WL_CONNECTED) initTime();
+  initTime();
 
   setupWebRoutes();
   server.begin();
-  Serial.println("[HTTP] Server gestartet");
+  serialLog("[HTTP] Server gestartet");
 }
 
 void loop() {
@@ -2034,24 +2560,59 @@ void loop() {
   #if EXTERN_BRIGHTNESS_BUTTON
     handleExternalBrightnessButton();
   #endif
-  
+  #if EXTERN_ESTP_BUTTON
+    handleEmergencyButton();
+  #endif
+
+  // Aktiven Kanal alle 5 s in NVS sichern (Stromausfallschutz)
+  {
+    static uint32_t lastActiveSave = 0;
+    if (anyChannelActive() && millis() - lastActiveSave > 5000) {
+      lastActiveSave = millis();
+      saveActiveChannelToNVS();
+    }
+  }
+
   maintainWifi();
   maintainMqtt();
   syncRtcFromNtp();
 
   if (!ntpSynced && WiFi.status() == WL_CONNECTED) {
     struct tm ti;
-    if (getLocalTime(&ti, 50)) { 
-      ntpSynced = true; 
-      Serial.println("[NTP] späte Sync ok"); 
+    if (getLocalTime(&ti, 50)) {
+      ntpSynced = true;
+      serialLog("[NTP] späte Sync ok");
     }
   }
-  
-  if (millis() - lastDisplayUpdate > DISPLAY_REFRESH_MS) {
+
+  // Wasserzähler periodisch in NVS sichern (alle 60 s)
+  #if WATER_METER_ENABLED
+  {
+    static uint32_t lastWaterSave = 0;
+    if (millis() - lastWaterSave > 60000) {
+      lastWaterSave = millis();
+      saveWaterCounter();
+    }
+  }
+  #endif
+
+  // Queue-Pause-Hinweis im Display (überschreibt normalen Status)
+  if (queuePaused && !taskQueue.empty()) {
+    static uint32_t lastQPBlink = 0;
+    if (millis() - lastQPBlink > 2000) {
+      lastQPBlink = millis();
+      u8g2.clearBuffer();
+      u8g2.setFont(OLED_FONT);
+      u8g2.setCursor(0, FONT_ASCENT);      u8g2.print("Queue pausiert");
+      u8g2.setCursor(0, FONT_ASCENT + 10); u8g2.print(String(taskQueue.size()) + " Aufgaben");
+      u8g2.setCursor(0, FONT_ASCENT + 20); u8g2.print("Taste druecken");
+      u8g2.sendBuffer();
+    }
+  } else if (millis() - lastDisplayUpdate > DISPLAY_REFRESH_MS) {
     lastDisplayUpdate = millis();
     manageBrightness();
     updateStatusDisplay();
   }
-  
+
   delay(5);
 }

@@ -1,13 +1,12 @@
-# Dokumentation für ESP32 Bewässerungssteuerung
+# Dokumentation — ESP32 Bewässerungssteuerung
 
 Diese Dokumentation beschreibt Aufbau, Installation, Konfiguration und Nutzung des Projekts.
 
 ## Inhalt
 
-- `installation.md` – Kompilierung und Upload
-- `hardware.md` – Benötigte Hardware und Pinbelegung
-- `configuration.md` – Einstellungen und Parameter
-- `usage.md` – Bedienung und Webinterface
-- `architektur.md` – Systemarchitektur und Softwareaufbau
-
-> Nutze die deutschsprachigen Seiten für eine strukturierte Projektübersicht.
+- [hardware.md](hardware.md) — Benötigte Hardware, Pinbelegung, Relais-Logik
+- [schematic.md](schematic.md) — Schematischer Anschlussplan (Blockdiagramm + Tabellen)
+- [installation.md](installation.md) — Kompilierung und Upload mit PlatformIO
+- [configuration.md](configuration.md) — Einstellungen, Parameter, optionale Hardware
+- [usage.md](usage.md) — Bedienung, Webinterface, Pläne, Queue, API
+- [architektur.md](architektur.md) — Systemarchitektur und Softwareaufbau
