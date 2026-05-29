@@ -151,6 +151,10 @@ static const uint8_t BRIGHTNESS_NORMAL = 255;
 static const uint8_t BRIGHTNESS_LOW = 50;
 static uint8_t currentBrightness = BRIGHTNESS_NORMAL;
 
+// --- Pixel-Shift (Displayschonung / Burn-in Prevention) ---
+static const uint32_t PIXEL_SHIFT_INTERVAL_MS = 3600000;  // Versatz-Wechsel alle 60 m
+static const int8_t   PIXEL_SHIFT_MAX         = 1;       // maximaler Versatz in Pixeln
+
 // --- Theme ---
 static const char* TH_BG     = "#0d1117";
 static const char* TH_PANEL  = "#161b22";
@@ -173,6 +177,11 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 static const int8_t FONT_ASCENT = 8;
 static const int8_t FONT_LINE_H = 10;
+
+static int8_t   dispOfsX      = 0;
+static int8_t   dispOfsY      = 0;
+static uint8_t  pixelShiftIdx = 0;
+static uint32_t lastPixelShift = 0;
 
 WebServer        server(80);
 DNSServer        dnsServer;
@@ -525,6 +534,17 @@ void manageBrightness() {
       serialLog("[OLED] Helligkeit: 100% (aktiv)");
     }
   }
+}
+
+// Pixel-Shift: verschiebt den Display-Ursprung periodisch um 1–2 Pixel,
+// um dauerhaft angezeigte statische Inhalte zu verteilen (Burn-in-Schutz).
+void tickPixelShift() {
+  if (millis() - lastPixelShift < PIXEL_SHIFT_INTERVAL_MS) return;
+  lastPixelShift = millis();
+  uint8_t n = (uint8_t)(PIXEL_SHIFT_MAX + 1);        // Positionen je Achse
+  dispOfsX = (int8_t)(pixelShiftIdx % n);
+  dispOfsY = (int8_t)(pixelShiftIdx / n);
+  pixelShiftIdx = (pixelShiftIdx + 1) % (n * n);      // zyklisch durch n×n Positionen
 }
 
 // Externe Taster-Handler: handleExternalBrightnessButton / handleEmergencyButton
@@ -1348,60 +1368,63 @@ void showQRCodeForAP() {
 
 void updateStatusDisplay() {
   if (currentMode == OP_AP) return;
+  tickPixelShift();
   u8g2.clearBuffer();
   u8g2.setFont(OLED_FONT);
   char buf[32];
-  int y = 0;
+  int y = dispOfsY;
+  const int ox = dispOfsX;
 
   if (winterActive) {
-    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print("WINTER-ENTW."); y += FONT_LINE_H;
+    u8g2.setCursor(ox, y + FONT_ASCENT); u8g2.print("WINTER-ENTW."); y += FONT_LINE_H;
     snprintf(buf, sizeof(buf), "Durchgang %u/%u", winterPass, WINTER_PASSES);
-    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
+    u8g2.setCursor(ox, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
     const char* ph = (winterPhase==WP_BLOW)?"BLASEN":(winterPhase==WP_PAUSE)?"PAUSE":"COOLDOWN";
     if (winterPhase == WP_BLOW) {
       snprintf(buf, sizeof(buf), "%.8s %s", channelShort(winterChannel).c_str(), ph);
     } else {
       strncpy(buf, ph, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
     }
-    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
+    u8g2.setCursor(ox, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
     uint32_t wrem = winterPhaseRemainingSec();
     snprintf(buf, sizeof(buf), "Rest: %02lu:%02lu:%02lu", wrem / 3600, (wrem % 3600) / 60, wrem % 60);
-    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
+    u8g2.setCursor(ox, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
     snprintf(buf, sizeof(buf), "kumRun: %us", winterCumRunSec);
-    u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf);
+    u8g2.setCursor(ox, y + FONT_ASCENT); u8g2.print(buf);
     u8g2.sendBuffer();
     return;
   }
 
-  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print("= Bewässerung ESP32 ="); y += FONT_LINE_H;
+  u8g2.setCursor(ox, y + FONT_ASCENT); u8g2.print("= Bewässerung ESP32 ="); y += FONT_LINE_H;
+  u8g2.drawHLine(ox, y, OLED_WIDTH - ox);
+  y += 2;
 
   if (WiFi.status() == WL_CONNECTED) {
     snprintf(buf, sizeof(buf), "%s [%d%%]", WiFi.localIP().toString().c_str(), getWifiSignalQuality());
   } else {
     strncpy(buf, "WiFi: offline", sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
   }
-  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
+  u8g2.setCursor(ox, y + FONT_ASCENT); u8g2.print(buf); y += FONT_LINE_H;
 
-  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(nowTimeStr()); y += FONT_LINE_H;
+  u8g2.setCursor(ox, y + FONT_ASCENT); u8g2.print(nowTimeStr()); y += FONT_LINE_H;
 
   bool any = false;
   for (uint8_t i = 0; i < 8; i++) {
     if (channels[i].active) {
       uint32_t rem = (channels[i].durationMs - (millis() - channels[i].startMs)) / 1000;
-      // Kanalname linksbündig, Restzeit rechtsbündig
       char timeBuf[9];
       snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02lu:%02lu", rem / 3600, (rem % 3600) / 60, rem % 60);
       int timeW = (int)strlen(timeBuf) * 6;
-      u8g2.setCursor(0, y + FONT_ASCENT);
+      u8g2.setCursor(ox, y + FONT_ASCENT);
       u8g2.print(channelShort(i));
-      u8g2.setCursor(OLED_WIDTH - timeW, y + FONT_ASCENT);
+      u8g2.setCursor(OLED_WIDTH - timeW + ox, y + FONT_ASCENT);
       u8g2.print(timeBuf);
       y += FONT_LINE_H;
       any = true;
     }
   }
   if (!any) {
-    u8g2.setCursor(0, y + FONT_ASCENT);
+    u8g2.setCursor(ox, y + FONT_ASCENT);
 #if WATER_METER_ENABLED
     char wbuf[20];
     snprintf(wbuf, sizeof(wbuf), "Aus  %.1fL", waterLiters());
@@ -1413,7 +1436,7 @@ void updateStatusDisplay() {
   }
 
   snprintf(buf, sizeof(buf), "Queue: %u", (unsigned)taskQueue.size());
-  u8g2.setCursor(0, y + FONT_ASCENT); u8g2.print(buf);
+  u8g2.setCursor(ox, y + FONT_ASCENT); u8g2.print(buf);
   u8g2.sendBuffer();
 }
 

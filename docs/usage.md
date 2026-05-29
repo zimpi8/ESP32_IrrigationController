@@ -57,16 +57,33 @@ Cooldown-Zyklen. Start über die Wintermodus-Seite.
 
 Das Display zeigt im Normalbetrieb:
 
-1. **Datum und Uhrzeit** — Format: `DD.MM.YYYY - HH:MM:SS`
-2. **IP-Adresse** (oder `AP-Modus` / `Verbinde...`)
-3. **Aktive Kanäle** — Kanalname (bis 12 Zeichen) links, verbleibende Zeit `HH:MM:SS` rechts
+1. **Überschrift** „= Bewässerung ESP32 =" mit horizontaler Trennlinie darunter
+2. **IP-Adresse** und WLAN-Signalstärke (oder `WiFi: offline`)
+3. **Datum und Uhrzeit** — Format: `DD.MM.YYYY - HH:MM:SS`
+4. **Aktive Kanäle** — Kanalname (bis 12 Zeichen) links, verbleibende Zeit `HH:MM:SS` rechts
+5. **Queue-Größe**
 
 Bei pausierter Queue nach Stromausfall blinkt eine Hinweismeldung.
 
+### Pixel-Shift (Burn-in-Schutz)
+
+Alle `PIXEL_SHIFT_INTERVAL_MS` (Standard: 60 s) verschiebt sich der gesamte
+Displayinhalt um 1–2 Pixel in X- und Y-Richtung. Der Versatz durchläuft
+zyklisch ein 3×3-Raster (9 Positionen), sodass kein Pixel dauerhaft mit
+gleicher Intensität leuchtet.
+
+Konfigurierbar in `src/main.cpp`:
+
+```cpp
+static const uint32_t PIXEL_SHIFT_INTERVAL_MS = 60000;  // Intervall in ms
+static const int8_t   PIXEL_SHIFT_MAX         = 2;       // max. Versatz in Pixeln
+```
+
 ### Helligkeit
 
-- **BOOT-Taste** (GPIO 0) kurz drücken: Helligkeit wechseln (3 Stufen) / Display aufwecken
+- **BOOT-Taste** (GPIO 0) kurz drücken: Helligkeit wechseln / Display aufwecken
 - Ext. Helligkeitstaster (GPIO 34, optional) hat dieselbe Funktion
+- Nach 10 Minuten Inaktivität: automatisch auf 30 % gedimmt
 
 ---
 

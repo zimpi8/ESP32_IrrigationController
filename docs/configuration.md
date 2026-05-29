@@ -68,10 +68,12 @@ Beispiele für POSIX-TZ-Strings:
 
 ## Display
 
-| Parameter     | Beschreibung                                                  |
-|---------------|---------------------------------------------------------------|
-| `CH_NAME_MAX` | Maximale Länge eines Kanalnamens (Speicher, Standard: 20)     |
-| `CH_DISP_MAX` | Maximale Anzahl Zeichen im OLED-Display (Standard: 12)        |
+| Parameter                  | Beschreibung                                                        |
+|----------------------------|---------------------------------------------------------------------|
+| `CH_NAME_MAX`              | Maximale Länge eines Kanalnamens (Speicher, Standard: 20)           |
+| `CH_DISP_MAX`              | Maximale Anzahl Zeichen im OLED-Display (Standard: 12)              |
+| `PIXEL_SHIFT_INTERVAL_MS`  | Intervall des Pixel-Shifts in Millisekunden (Standard: 60 000 = 1 min) |
+| `PIXEL_SHIFT_MAX`          | Maximaler Pixelversatz je Achse (Standard: 2 → 3×3 = 9 Positionen) |
 
 ---
 
