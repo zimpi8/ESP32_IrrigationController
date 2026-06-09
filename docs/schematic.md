@@ -13,25 +13,25 @@
                     │  GPIO 4 (SCL) ──────────────────────────── ┼──── SCL ──► (I²C-Bus)
                     │                                            │            ► DS3231 RTC
                     │                                            │
-                    │  GPIO 13 ──────────────────────────────────┼──────────► Relais K1
-                    │  GPIO 14 ──────────────────────────────────┼──────────► Relais K2
-                    │  GPIO 25 ──────────────────────────────────┼──────────► Relais K3
-                    │  GPIO 26 ──────────────────────────────────┼──────────► Relais K4
-                    │  GPIO 16 ──────────────────────────────────┼──────────► Relais K5
-                    │  GPIO 2  ──────────────────────────────────┼──────────► Relais K6
-                    │  GPIO 15 ──────────────────────────────────┼──────────► Relais K7
-                    │  GPIO 3  ──────────────────────────────────┼──────────► Relais K8
+                    │  GPIO 13 (D13, oben) ──────────────────────┼──────────► Relais K1
+                    │  GPIO 17 (TX2, unten)──────────────────────┼──────────► Relais K2
+                    │  GPIO 14 (D14, oben) ──────────────────────┼──────────► Relais K3
+                    │  GPIO 27 (D27, oben) ──────────────────────┼──────────► Relais K4
+                    │  GPIO 26 (D26, oben) ──────────────────────┼──────────► Relais K5
+                    │  GPIO 25 (D25, oben) ──────────────────────┼──────────► Relais K6
+                    │  GPIO 33 (D33, oben) ──────────────────────┼──────────► Relais K7
+                    │  GPIO 32 (D32, oben) ──────────────────────┼──────────► Relais K8
                     │                                            │
                     │  GPIO 0  ──[BOOT-Taster]─── GND           │  AP-Modus / Display-Helligkeit
                     │                                            │
                     │  GPIO 34 ──[Taster]────────── GND         │  * Ext. Helligkeit / AP-Modus
                     │            └──[10 kΩ]──────── 3V3         │    (EXTERN_BRIGHTNESS_BUTTON)
                     │                                            │
-                    │  GPIO 32 ──[Taster]────────── GND         │  * Ext. NOT-AUS
-                    │                                            │    (EXTERN_ESTP_BUTTON)
+                    │  GPIO 35 ──[Taster]────────── GND         │  * Ext. NOT-AUS
+                    │            └──[10 kΩ]──────── 3V3         │    (EXTERN_ESTP_BUTTON)
                     │                                            │
-                    │  GPIO 33 ──[Reed / Hall]────── GND        │  * Wasserzähler-Impuls
-                    │                                            │    (WATER_METER_ENABLED)
+                    │  GPIO 36 ──[Reed / Hall]────── GND        │  * Wasserzähler-Impuls
+                    │  (VP)      └──[10 kΩ]──────── 3V3         │    (WATER_METER_ENABLED)
                     └────────────────────────────────────────────┘
 
 * = optionale Erweiterungen, per #define aktivierbar
@@ -41,22 +41,22 @@
 
 ## Pinbelegung (Tabelle)
 
-| GPIO | Funktion                        | Richtung | Anmerkung                                   |
-|------|---------------------------------|----------|---------------------------------------------|
-| 13   | Relais Kanal 1                  | Ausgang  | Aktiv LOW (Standard)                        |
-| 14   | Relais Kanal 2                  | Ausgang  |                                             |
-| 25   | Relais Kanal 3                  | Ausgang  |                                             |
-| 26   | Relais Kanal 4                  | Ausgang  |                                             |
-| 16   | Relais Kanal 5                  | Ausgang  |                                             |
-| 2    | Relais Kanal 6                  | Ausgang  | Eingebaute LED blinkt beim Booten           |
-| 15   | Relais Kanal 7                  | Ausgang  |                                             |
-| 3    | Relais Kanal 8                  | Ausgang  | Auch UART RX0 – nicht gleichzeitig nutzen   |
-| 5    | I²C SDA                         | I/O      | OLED + DS3231 RTC                           |
-| 4    | I²C SCL                         | I/O      | OLED + DS3231 RTC                           |
-| 0    | BOOT-/AP-Taster                 | Eingang  | Interner Pull-Up, kurz = Helligkeit, 3 s = AP-Modus |
-| 34   | Ext. Helligkeits-/AP-Taster *   | Eingang  | **Input-only**, kein int. Pull-Up → ext. 10 kΩ nach 3V3 erforderlich |
-| 32   | Ext. NOT-AUS-Taster *           | Eingang  | Interner Pull-Up nutzbar, 5 s halten → Neustart |
-| 33   | Wasserzähler-Impuls *           | Eingang  | Interner Pull-Up, Reed-Kontakt oder Hall-Sensor |
+| GPIO | Boardpin | Funktion                        | Richtung | Anmerkung                                            |
+|------|----------|---------------------------------|----------|------------------------------------------------------|
+| 13   | D13      | Relais Kanal 1                  | Ausgang  | Aktiv LOW (Standard), obere Reihe                    |
+| 17   | TX2      | Relais Kanal 2                  | Ausgang  | Untere Reihe (GPIO12 übersprungen – Strapping-Pin)   |
+| 14   | D14      | Relais Kanal 3                  | Ausgang  | Obere Reihe                                          |
+| 27   | D27      | Relais Kanal 4                  | Ausgang  | Obere Reihe                                          |
+| 26   | D26      | Relais Kanal 5                  | Ausgang  | Obere Reihe                                          |
+| 25   | D25      | Relais Kanal 6                  | Ausgang  | Obere Reihe                                          |
+| 33   | D33      | Relais Kanal 7                  | Ausgang  | Obere Reihe                                          |
+| 32   | D32      | Relais Kanal 8                  | Ausgang  | Obere Reihe                                          |
+| 5    | D5       | I²C SDA                         | I/O      | OLED + DS3231 RTC                                    |
+| 4    | D4       | I²C SCL                         | I/O      | OLED + DS3231 RTC                                    |
+| 0    | BOOT     | BOOT-/AP-Taster                 | Eingang  | Interner Pull-Up, kurz = Helligkeit, 3 s = AP-Modus |
+| 34   | D34      | Ext. Helligkeits-/AP-Taster *   | Eingang  | **Input-only**, ext. 10 kΩ nach 3V3 erforderlich    |
+| 35   | D35      | Ext. NOT-AUS-Taster *           | Eingang  | **Input-only**, ext. 10 kΩ nach 3V3, 5 s → Neustart |
+| 36   | VP       | Wasserzähler-Impuls *           | Eingang  | **Input-only**, ext. 10 kΩ nach 3V3, Reed/Hall      |
 
 ---
 
@@ -81,17 +81,22 @@ DS3231-Adresse: 0x68 (fest)
 
 ```
 ESP32                       8-Kanal-Relaismodul
-GPIO 13 ────────────────── IN1
-GPIO 14 ────────────────── IN2
-GPIO 25 ────────────────── IN3
-GPIO 26 ────────────────── IN4
-GPIO 16 ────────────────── IN5
-GPIO 2  ────────────────── IN6
-GPIO 15 ────────────────── IN7
-GPIO 3  ────────────────── IN8
+GPIO 13 (D13, oben)  ───── IN1
+GPIO 17 (TX2, unten) ───── IN2   ← separate Leitung (untere Reihe)
+GPIO 14 (D14, oben)  ───── IN3
+GPIO 27 (D27, oben)  ───── IN4
+GPIO 26 (D26, oben)  ───── IN5
+GPIO 25 (D25, oben)  ───── IN6
+GPIO 33 (D33, oben)  ───── IN7
+GPIO 32 (D32, oben)  ───── IN8
 5V / 3V3 ───────────────── VCC  (je nach Modul)
 GND      ───────────────── GND
 ```
+
+> K1 und K3–K8 (GPIO 13, 14, 27, 26, 25, 33, 32) liegen auf der oberen Pinreihe
+> und können über ein 7-adriges Flachbandkabel verbunden werden. GPIO 12 zwischen
+> D13 und D14 bleibt unverkabelt (Strapping-Pin). K2 (GPIO 17/TX2) benötigt eine
+> separate Leitung auf der unteren Reihe.
 
 > Standardmäßig ist `RELAY_ACTIVE_LOW_DEFAULT = true`. Die Relais schalten bei LOW-Signal.
 > Aktiv-HIGH-Module: `relayActiveLow` in der Weboberfläche → Konfiguration umschalten.
@@ -115,22 +120,32 @@ GND      ───────────────── GND
 > floating Pin beim Booten AP-Modus aus.
 > Im Code aktivieren: `#define EXTERN_BRIGHTNESS_BUTTON 1`
 
-### Externer NOT-AUS-Taster (GPIO 32)
+### Externer NOT-AUS-Taster (GPIO 35 / D35)
 
 ```
-GPIO 32 ──[Taster]── GND
+3V3 ──[10 kΩ]──┬── GPIO 35
+               │
+            [Taster]
+               │
+              GND
 ```
 
-> Interner Pull-Up wird per `INPUT_PULLUP` aktiviert.
+> GPIO 35 ist **Input-only** ohne internen Pull-Up → ext. 10-kΩ-Widerstand nach 3V3 erforderlich.
 > 5 Sekunden halten → ESP32 Neustart.
+> GPIO 32 ist als Relaiskanal 8 belegt und steht nicht mehr zur Verfügung.
 > Im Code aktivieren: `#define EXTERN_ESTP_BUTTON 1`
 
-### Wasserzähler-Impuls (GPIO 33)
+### Wasserzähler-Impuls (GPIO 36 / VP)
 
 ```
-GPIO 33 ──[Reed-Kontakt oder Hall-Sensor]── GND
+3V3 ──[10 kΩ]──┬── GPIO 36 (VP)
+               │
+        [Reed / Hall-Sensor]
+               │
+              GND
 ```
 
-> Interner Pull-Up aktiv. Jeder Schließkontakt zählt als ein Impuls.
+> GPIO 36 (VP) ist **Input-only** ohne internen Pull-Up → ext. 10-kΩ-Widerstand nach 3V3 erforderlich.
+> GPIO 33 ist als Relaiskanal 7 belegt und steht nicht mehr zur Verfügung.
 > Impulse pro Liter in der Weboberfläche konfigurierbar.
 > Im Code aktivieren: `#define WATER_METER_ENABLED 1`

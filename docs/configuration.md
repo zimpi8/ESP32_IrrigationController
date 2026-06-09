@@ -57,12 +57,13 @@ Beispiele für POSIX-TZ-Strings:
 
 ## Laufzeit & Steuerung
 
-| Parameter           | Beschreibung                                           |
-|---------------------|--------------------------------------------------------|
-| `DEFAULT_RUNTIME_SEC` | Standardlaufzeit pro Kanal (Sekunden)               |
-| `MIN_GAP_SEC`       | Mindestpause zwischen zwei Kanalstarts               |
-| `MAX_RUNTIME_SEC`   | Maximale Laufzeit pro Kanal                          |
-| `SINGLE_CHANNEL_MODE` | Wenn `true`: immer nur ein Kanal gleichzeitig aktiv |
+| Parameter             | Beschreibung                                                      |
+|-----------------------|-------------------------------------------------------------------|
+| `DEFAULT_RUNTIME_SEC` | Standardlaufzeit pro Kanal (Sekunden)                             |
+| `MIN_GAP_SEC`         | Mindestpause (Sekunden) bevor derselbe Kanal erneut starten darf  |
+| `MIN_SWITCH_GAP_MS`   | Mindestpause (ms) zwischen zwei beliebigen Kanalumschaltungen     |
+| `MAX_RUNTIME_SEC`     | Maximale Laufzeit pro Kanal                                       |
+| `SINGLE_CHANNEL_MODE` | Wenn `true`: immer nur ein Kanal gleichzeitig aktiv               |
 
 ---
 
@@ -101,7 +102,7 @@ Kurzer Druck: OLED-Helligkeit wechseln / Display aufwecken
 > **Achtung:** GPIO 34 benötigt einen externen 10-kΩ-Pull-Up-Widerstand nach 3V3.
 > Floating Pin → AP-Modus beim Booten!
 
-### Externer NOT-AUS-Taster (GPIO 32)
+### Externer NOT-AUS-Taster (GPIO 35 / D35)
 
 ```cpp
 #define EXTERN_ESTP_BUTTON 0   // 0 = deaktiviert (Standard)
@@ -109,11 +110,17 @@ Kurzer Druck: OLED-Helligkeit wechseln / Display aufwecken
 
 5 Sekunden halten: Alle Kanäle stoppen + ESP32 Neustart.
 
-### Wasserzähler-Impulseingang (GPIO 33)
+> GPIO 35 ist Input-only → **ext. 10 kΩ Pull-Up nach 3V3 erforderlich**.
+> GPIO 32 ist als Relaiskanal 8 belegt.
+
+### Wasserzähler-Impulseingang (GPIO 36 / VP)
 
 ```cpp
 #define WATER_METER_ENABLED 0   // 0 = deaktiviert (Standard)
 ```
+
+> GPIO 36 (VP) ist Input-only → **ext. 10 kΩ Pull-Up nach 3V3 erforderlich**.
+> GPIO 33 ist als Relaiskanal 7 belegt.
 
 Zählt Impulse über Reed-Kontakt oder Hall-Sensor.
 Impulse pro Liter in der Weboberfläche unter **Konfiguration** einstellbar.
