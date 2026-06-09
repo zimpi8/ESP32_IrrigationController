@@ -23,6 +23,7 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <time.h>
+#include "esp_sntp.h"
 #include <stdarg.h>
 #include <sys/time.h>
 #include <Wire.h>
@@ -37,7 +38,9 @@
 // =================== KONFIGURATION ==========================
 // ============================================================
 
-static const uint8_t  CHANNEL_PINS[8]   = { 13, 14, 25, 26, 16, 2, 15, 3 };
+// K1,K3–K8: obere Reihe D13 D14 D27 D26 D25 D33 D32 (D12 übersprungen – Strapping-Pin)
+// K2:       untere Reihe TX2/D17 (GPIO17) als Ersatz für GPIO12
+static const uint8_t  CHANNEL_PINS[8]   = { 13, 17, 14, 27, 26, 25, 33, 32 };
 static const bool     RELAY_ACTIVE_LOW_DEFAULT = true;
 
 #define OLED_WIDTH    128
@@ -68,18 +71,20 @@ static const uint32_t AP_BUTTON_HOLD_MS = 3000;
   static const uint32_t EXT_AP_HOLD_MS        = 3000;
 #endif
 
-// Externer NOT-AUS-Taster (GPIO 32, interner Pull-Up verfügbar)
+// Externer NOT-AUS-Taster (GPIO 35, Input-only, BENÖTIGT ext. Pull-Up 10kΩ nach 3V3)
 // Halten >= 5 s: stoppt alle Kanäle + Neustart ESP32
+// Hinweis: GPIO 32 wird als Kanal 8 genutzt
 #define EXTERN_ESTP_BUTTON 0
 #if EXTERN_ESTP_BUTTON
-  static const uint8_t  PIN_ESTP_BUTTON = 32;
+  static const uint8_t  PIN_ESTP_BUTTON = 35;
   static const uint32_t ESTP_HOLD_MS    = 5000;
 #endif
 
-// Impulseingang Wasserzähler (GPIO 33, interner Pull-Up verfügbar)
+// Impulseingang Wasserzähler (GPIO 36 / VP, Input-only, BENÖTIGT ext. Pull-Up 10kΩ nach 3V3)
+// Hinweis: GPIO 33 wird als Kanal 7 genutzt
 #define WATER_METER_ENABLED 0
 #if WATER_METER_ENABLED
-  static const uint8_t PIN_WATER_METER = 33;
+  static const uint8_t PIN_WATER_METER = 36;
 #endif
 static const uint32_t WATER_IPL_DEFAULT = 100;  // Impulse pro Liter (Standard)
 
@@ -104,6 +109,7 @@ static const uint8_t TZ_STRING_MAX = 48;
 static const uint16_t DEFAULT_RUNTIME_SEC = 1800;
 static const uint16_t MAX_RUNTIME_SEC     = 7200;
 static const uint16_t MIN_GAP_SEC         = 5;
+static const uint32_t MIN_SWITCH_GAP_MS   = 1000;
 static const bool     SINGLE_CHANNEL_MODE = true;
 
 static const uint8_t  MAX_GROUPS     = 8;
@@ -214,8 +220,9 @@ struct MqttRetryEvent {
 };
 std::deque<MqttRetryEvent> mqttRetryQueue;
 
-bool rtcPresent = false;
-uint32_t lastRtcSync = 0;
+bool rtcPresent   = false;
+bool rtcTimeValid = false;  // true nur wenn RTC-Zeit gültig (kein lostPower)
+uint32_t lastRtcSync = (uint32_t)-RTC_SYNC_INTERVAL_MS;  // erster Sync sofort nach NTP
 
 static uint32_t lastWifiReconnectAttempt = 0;
 
@@ -253,6 +260,7 @@ uint32_t buttonPressedSince = 0;
 uint32_t lastDisplayUpdate  = 0;
 uint32_t lastScheduleCheck  = 0;
 uint32_t lastMqttRetry      = 0;
+uint32_t lastAnyStopMs      = 0;
 bool     ntpSynced          = false;
 bool     rtcSynced          = false;
 
@@ -289,6 +297,7 @@ bool checkWebAuthOnly();
 String buildApConfigHtml(const String&msg);
 void loadWifiCreds();
 void saveChannelName(uint8_t i, const String& name);
+static const uint8_t LOG_CHANNEL_NONE = 0xFF;
 void logEvent(uint8_t channel, const char* action, uint16_t durationSec, const char* source);
 
 // ============================================================
@@ -359,6 +368,9 @@ void initRTC() {
   }
   if (rtc.lostPower()) {
     serialLog("[RTC] Batterieverlust erkannt, Zeit ungültig");
+    rtcTimeValid = false;
+  } else {
+    rtcTimeValid = true;
   }
   rtcPresent = true;
   serialLog("[RTC] DS3231 OK");
@@ -372,9 +384,10 @@ bool setSystemTimeFromRtc() {
   ti.tm_year = now.year() - 1900;
   ti.tm_mon  = now.month() - 1;
   ti.tm_mday = now.day();
-  ti.tm_hour = now.hour();
-  ti.tm_min  = now.minute();
-  ti.tm_sec  = now.second();
+  ti.tm_hour   = now.hour();
+  ti.tm_min    = now.minute();
+  ti.tm_sec    = now.second();
+  ti.tm_isdst  = -1;  // mktime bestimmt DST anhand Datum + TZ
   time_t epoch = mktime(&ti);
   if (epoch == (time_t)-1) return false;
   struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
@@ -391,7 +404,8 @@ void syncRtcFromNtp() {
   rtc.adjust(DateTime(ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
                       ti.tm_hour, ti.tm_min, ti.tm_sec));
   serialLog("[RTC] synchronisiert mit NTP");
-  rtcSynced = true;
+  rtcSynced    = true;
+  rtcTimeValid = true;
 }
 
 String getRtcTimeStr() {
@@ -438,7 +452,7 @@ String nowTimeStr() {
 struct tm getLocalTimeWithFallback() {
   struct tm ti;
   if (getLocalTime(&ti, 50)) return ti;
-  if (rtcPresent) return getRtcLocalTime();
+  if (rtcTimeValid) return getRtcLocalTime();
   memset(&ti, 0, sizeof(ti));
   return ti;
 }
@@ -584,8 +598,9 @@ void logEvent(uint8_t channel, const char* action, uint16_t durationSec, const c
   } else {
     strcpy(timestamp, "YYYY-MM-DD HH:MM:SS");
   }
-  String nm = channelName(channel);
-  String line = String(timestamp) + "," + String(channel + 1) + "," + nm + "," +
+  String nm = (channel == LOG_CHANNEL_NONE) ? String("") : channelName(channel);
+  String ch = (channel == LOG_CHANNEL_NONE) ? String("") : String(channel + 1);
+  String line = String(timestamp) + "," + ch + "," + nm + "," +
                 String(action) + "," + String(durationSec) + "," + String(source) + "\n";
 
   File f = LittleFS.open(LOG_FILE, "a");
@@ -752,6 +767,7 @@ void stopChannel(uint8_t ch) {
   writeRelay(ch, false);
   if (channels[ch].active) {
     channels[ch].lastStopMs = millis();
+    lastAnyStopMs = channels[ch].lastStopMs;
     uint32_t elapsed = (millis() - channels[ch].startMs) / 1000;
     logEvent(ch, "STOP", (uint16_t)elapsed, "manual");
     serialLogf("[%s] STOP (%lus)\n", channelName(ch).c_str(), (unsigned long)elapsed);
@@ -837,6 +853,7 @@ void loadQueueFromNVS() {
     queuePaused = true;
     serialLogf("[QUEUE] %u Aufgaben aus NVS wiederhergestellt – warte auf Taste\n",
                (unsigned)taskQueue.size());
+    logEvent(LOG_CHANNEL_NONE, "QUEUE_RESTORE", 0, "system");
   }
 }
 
@@ -851,7 +868,7 @@ void clearQueue(const char* source) {
   queuePaused = false;
   saveQueueToNVS();
   serialLog("[QUEUE] geleert");
-  logEvent(0, "QUEUE_CLEAR", 0, source);
+  logEvent(LOG_CHANNEL_NONE, "QUEUE_CLEAR", 0, source);
 }
 
 void processQueue() {
@@ -863,6 +880,7 @@ void processQueue() {
   if (SINGLE_CHANNEL_MODE && anyChannelActive()) return;
   if (taskQueue.empty()) return;
   WateringTask t = taskQueue.front();
+  if (lastAnyStopMs && (millis() - lastAnyStopMs) < MIN_SWITCH_GAP_MS) return;
   if (channels[t.channel].lastStopMs &&
       (millis() - channels[t.channel].lastStopMs) < (uint32_t)MIN_GAP_SEC * 1000UL) return;
   taskQueue.pop_front();
@@ -918,6 +936,7 @@ void loadActiveChannelFromNVS() {
     queuePaused          = true;
     queueRestoredFromNVS = true;
     serialLogf("[ACTIVE] Kanal %u: %us Restzeit wiederhergestellt (vorne in Queue)\n", ch + 1, rem);
+    logEvent(ch, "ACTIVE_RESTORE", rem, "system");
   }
 }
 
@@ -939,7 +958,7 @@ void startWinterization() {
   if (winterActive) return;
   stopAllChannels(); clearQueue();
   winterActive = true; winterPass = 1; winterChannel = 0; winterCumRunSec = 0;
-  logEvent(0, "WINTER_START", 0, "system");
+  logEvent(LOG_CHANNEL_NONE, "WINTER_START", 0, "system");
   winterBeginBlow();
 }
 
@@ -947,7 +966,7 @@ void stopWinterization() {
   if (!winterActive) return; 
   winterActive = false; 
   stopAllChannels(); 
-  logEvent(0, "WINTER_STOP", 0, "system"); 
+  logEvent(LOG_CHANNEL_NONE, "WINTER_STOP", 0, "system"); 
 }
 
 void winterAdvanceAfterBlow() {
@@ -995,8 +1014,10 @@ void loadGroups() {
   else                       memset(groups, 0, sizeof(groups));
   prefs.end();
   for (uint8_t i = 0; i < MAX_GROUPS; i++) {
-    groups[i].lastRunDay = 0;
-    groups[i].lastRunMin = 0xFFFF;
+    if (sz != sizeof(groups)) {
+      groups[i].lastRunDay = 0;
+      groups[i].lastRunMin = 0xFFFF;
+    }
     groups[i].name[GROUP_NAME_MAX] = '\0';
     if (groups[i].stepCount > MAX_STEPS) groups[i].stepCount = 0;
   }
@@ -1112,7 +1133,14 @@ void checkGroups() {
   // Rückwärts-Umstellung: lastRunDay-Guard verhindert Doppelausführung.
   static uint16_t prevMin = 0xFFFF;
   static uint32_t prevDay = 0;
+  static bool firstCheck = true;
   bool newDay = (prevDay != today);
+  if (firstCheck) {
+    prevDay = today;
+    prevMin = (nowMin == 0) ? 1439 : (uint16_t)(nowMin - 1);
+    firstCheck = false;
+    newDay = false;
+  }
   if (newDay) { prevDay = today; }
 
   for (uint8_t g = 0; g < MAX_GROUPS; g++) {
@@ -1133,7 +1161,9 @@ void checkGroups() {
 
     for (uint8_t k = 0; k < G.stepCount; k++)
       enqueueTask(G.steps[k].channel, G.steps[k].durationSec, "plan");
-    G.lastRunDay = today; G.lastRunMin = schMin;
+    G.lastRunDay = today;
+    G.lastRunMin = schMin;
+    saveGroups();
     serialLogf("[GROUP %u] '%s' getriggert (%u Schritte)\n", g, groupLabel(g).c_str(), G.stepCount);
   }
 
@@ -1283,7 +1313,7 @@ void initTime() {
   const char* tz = (tzString[0] != '\0') ? tzString : TZ_DEFAULT;
   configTzTime(tz, NTP_SERVER);
   struct tm ti;
-  if (getLocalTime(&ti, 8000)) {
+  if (getLocalTime(&ti, 8000) && sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
     ntpSynced = true;
     serialLog("[NTP] sync");
   }
@@ -1430,7 +1460,7 @@ void updateStatusDisplay() {
     snprintf(wbuf, sizeof(wbuf), "Aus  %.1fL", waterLiters());
     u8g2.print(wbuf);
 #else
-    u8g2.print("Alle Kanale aus");
+    u8g2.print("Alle Kanäle aus");
 #endif
     y += FONT_LINE_H;
   }
@@ -2093,8 +2123,8 @@ void handleStopAll() {
   if (!checkAuth()) return;
   stopWinterization(); 
   stopAllChannels(); 
-  clearQueue("notaus");
-  logEvent(0, "NOT-AUS", 0, "system");
+  clearQueue("not-aus");
+  logEvent(LOG_CHANNEL_NONE, "NOT-AUS", 0, "system");
   server.sendHeader("Location","/"); 
   server.send(303);
 }
@@ -2474,7 +2504,7 @@ void handleEmergencyButton() {
     } else if (millis() - estpPressedSince >= ESTP_HOLD_MS) {
       serialLog("[ESTP] NOT-AUS ausgelöst — Neustart!");
       stopWinterization(); stopAllChannels(); clearQueue();
-      logEvent(0, "ESTP_RESTART", 0, "hardware");
+      logEvent(LOG_CHANNEL_NONE, "ESTP_RESTART", 0, "hardware");
       delay(500);
       ESP.restart();
     }
@@ -2494,10 +2524,6 @@ void setup() {
   delay(200);
   Wire.begin(PIN_SDA, PIN_SCL);
   initRTC();
-  if (setSystemTimeFromRtc()) {
-    rtcSynced = true;
-    serialLog("[RTC] Systemzeit aus RTC gesetzt");
-  }
   serialLog("\n=== ESP32 Bewässerungssteuerung ===");
   serialLog("[INFO] v4: TZ/DST | Monate | Queue-NVS | Ext.Taster | Wasserz.");
   #if EXTERN_BRIGHTNESS_BUTTON
@@ -2548,7 +2574,7 @@ void setup() {
 
   initLogging();
   delay(100);
-  logEvent(0, "SYSTEM_START", 0, "system");
+  logEvent(LOG_CHANNEL_NONE, "SYSTEM_START", 0, "system");
 
   loadWifiCreds();
   loadChannelNames();
@@ -2559,9 +2585,13 @@ void setup() {
   loadMiscConfig();
   loadQueueFromNVS();
   loadActiveChannelFromNVS();  // aktiver Kanal vor Queue-Einträgen einfügen
-  // TZ sofort anwenden (vor NTP-Sync)
+  // TZ sofort anwenden (vor RTC- und NTP-Sync)
   setenv("TZ", tzString[0] ? tzString : TZ_DEFAULT, 1);
   tzset();
+  if (setSystemTimeFromRtc()) {
+    rtcSynced = true;
+    serialLog("[RTC] Systemzeit aus RTC gesetzt");
+  }
 
   wifiBeginSTA();
   initTime();
@@ -2602,7 +2632,7 @@ void loop() {
 
   if (!ntpSynced && WiFi.status() == WL_CONNECTED) {
     struct tm ti;
-    if (getLocalTime(&ti, 50)) {
+    if (getLocalTime(&ti, 50) && sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
       ntpSynced = true;
       serialLog("[NTP] späte Sync ok");
     }
